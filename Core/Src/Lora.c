@@ -1,7 +1,9 @@
 #include "LoRa.h"
 #include "string.h"
+#include "cmsis_os.h"  // RTOS ve Semafor fonksiyonları için gerekli
 
 extern UART_HandleTypeDef huart3;
+extern osSemaphoreId_t uartTxSemaphoreHandle; // main.c'den gelen semafor
 
 uint8_t receiveBuffer;
 TelemetryPacket telemetryQueue[QUEUE_SIZE];
@@ -82,10 +84,13 @@ void LoRa_SendNextPacket(void)
 	txBuffer[2] = 0x1F; // Hedef Kanal (Channel)
 	memcpy(&txBuffer[3], &telemetryQueue[queueFront], sizeof(TelemetryPacket));
 
-	if(HAL_UART_Transmit_IT(&huart3, txBuffer, sizeof(txBuffer)) == HAL_OK)    {
-        waitingAck = true;
-        lastSendTime = HAL_GetTick();
-    }
+	if (HAL_UART_Transmit_IT(&huart3, txBuffer, sizeof(txBuffer)) == HAL_OK) {
+		// İletim süresince görevi (Task) beklemeye alıyoruz ki CPU serbest kalsın
+		if (osSemaphoreAcquire(uartTxSemaphoreHandle, 100) == osOK) {
+			waitingAck = true;
+			lastSendTime = HAL_GetTick();
+		}
+	}
 }
 
 void LoRa_ResendPacket(void)
@@ -102,10 +107,13 @@ void LoRa_ResendPacket(void)
 	txBuffer[2] = 0x1F; // Hedef Kanal
 	memcpy(&txBuffer[3], &telemetryQueue[queueFront], sizeof(TelemetryPacket));
 
-    // Bloking transmit kullan — bu başarısız olamaz
-	if (HAL_UART_Transmit(&huart3, txBuffer, sizeof(txBuffer), 600) == HAL_OK) {
-		waitingAck = true;
-		lastSendTime = HAL_GetTick();
+	// Bloking transmit YERİNE, IT ve Semafor kullanıyoruz
+	if (HAL_UART_Transmit_IT(&huart3, txBuffer, sizeof(txBuffer)) == HAL_OK) {
+		// CPU'yu bloklamadan iletimin (Tx) bitmesini bekliyoruz (Maks 600ms)
+		if (osSemaphoreAcquire(uartTxSemaphoreHandle, 600) == osOK) {
+			waitingAck = true;
+			lastSendTime = HAL_GetTick();
+		}
 	}
 }
 
