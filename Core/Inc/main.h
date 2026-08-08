@@ -49,8 +49,6 @@ extern "C" {
 
 /* USER CODE END EM */
 
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
-
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -79,26 +77,16 @@ void Error_Handler(void);
 #define H2_ADC_GPIO_Port GPIOA
 #define H2_DAC_Pin GPIO_PIN_5
 #define H2_DAC_GPIO_Port GPIOA
-#define MUX_S0_Pin GPIO_PIN_6
-#define MUX_S0_GPIO_Port GPIOA
-#define MUX_S1_Pin GPIO_PIN_7
-#define MUX_S1_GPIO_Port GPIOA
-#define MUX_S2_Pin GPIO_PIN_4
-#define MUX_S2_GPIO_Port GPIOC
-#define MUX_EN_Pin GPIO_PIN_5
-#define MUX_EN_GPIO_Port GPIOC
-#define MUX_ADC_Pin GPIO_PIN_0
+#define MUX_ADC_Pin GPIO_PIN_1
 #define MUX_ADC_GPIO_Port GPIOB
-#define Y_MUX_ADC_Pin GPIO_PIN_1
-#define Y_MUX_ADC_GPIO_Port GPIOB
-#define Y_MUX_S0_Pin GPIO_PIN_7
-#define Y_MUX_S0_GPIO_Port GPIOE
-#define Y_MUX_S1_Pin GPIO_PIN_8
-#define Y_MUX_S1_GPIO_Port GPIOE
-#define Y_MUX_S2_Pin GPIO_PIN_9
-#define Y_MUX_S2_GPIO_Port GPIOE
-#define Y_MUX_EN_Pin GPIO_PIN_10
-#define Y_MUX_EN_GPIO_Port GPIOE
+#define MUX_S0_Pin GPIO_PIN_7
+#define MUX_S0_GPIO_Port GPIOE
+#define MUX_S1_Pin GPIO_PIN_8
+#define MUX_S1_GPIO_Port GPIOE
+#define MUX_S2_Pin GPIO_PIN_9
+#define MUX_S2_GPIO_Port GPIOE
+#define MUX_EN_Pin GPIO_PIN_10
+#define MUX_EN_GPIO_Port GPIOE
 #define RF_PARAMETRE_Pin GPIO_PIN_10
 #define RF_PARAMETRE_GPIO_Port GPIOD
 #define LED8_Pin GPIO_PIN_4
