@@ -12,9 +12,9 @@
  ******************************************************************************
  * @file           : main.c
  * @project        : VoltaFCEV Vehicle Control Unit Firmware
- * @version        : 2.1.0 (FreeRTOS integrated)
+ * @version        : 2.2.0 (FreeRTOS integrated)
  * @author         : VCU TEAM
- * @date           : 09-08-2026
+ * @date           : 17-08-2026
  ******************************************************************************
  * @note
  * This firmware handles CAN communication with BMS, motor controller
@@ -49,16 +49,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define R_PULLDOWN 10000.0f   // 10K pull-down direnci
-#define VCC         3.3f
-#define BETA        3950.0f
-#define T0          298.15f   // 25°C = 298.15K
-#define R0          10000.0f  // 25°C'de NTC direnci
-#define BMS_RX_BUFFER_SIZE 256
-#define DRIVER_RX_BUFFER_SIZE 128 // 30 yerine daha geniş bir alan verelim
 
-#define FILTER_COEFF 0.001f
-#define FLOAT_TOLERANCE 0.001f
+// THINKING TTS2A103F39H1RA0 NTC'sinin fiziksel parametreleri
+#define R0			10000.0f	// NTC'nin 25°C'deki nominal direnci
+#define T0			298.15f		// 25°C'nin Kelvin karşılığı
+#define BETA		3975.0f		// Datasheet'ten alınan BETA katsayısı
+#define R_PULLDOWN	10000.0f	// Karttaki R4-R11 seri pull-down dirençleri (10k)
+#define VCC         3.3f
+
+#define DRIVER_RX_BUFFER_SIZE 128
+
+#define ADC2_BUFFER_SIZE 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -69,6 +70,7 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
+DMA_HandleTypeDef hdma_adc2;
 
 CAN_HandleTypeDef hcan1;
 
@@ -157,24 +159,22 @@ uint32_t MotorControllerTxInformation[5];
 uint32_t BMSTxInformation[5];
 uint8_t DireksiyonTxInformation[5];
 
+// Ekran
 uint8_t buffer[9] = { 0x5A, 0xA5, 0x05, 0x82 };
 float kusurat;
 
+// BYS
 float min_cell_v = 5.0f, avg_cell_v = 0, max_cell_v = 0;
-float battery_voltage = 0;   	 // Toplam paket voltajı
-int16_t battery_current = 0;  	 // Anlık akım
-uint8_t battery_soc = 0;       	 // Şarj durumu
-float cell_voltages[48];     // Her hücrenin voltajı
+float battery_voltage = 0;		// Toplam paket voltajı
+int16_t battery_current = 0;	// Anlık akım
+uint8_t battery_soc = 0;		// Şarj durumu
+float cell_voltages[48];		// Her hücrenin voltajı
 float ntc_temperatures[2];
 uint8_t min_temp = 0, max_temp = 0;
 uint16_t v_raw, i_raw, s_raw;
 
-/*uint8_t surucu_data[8];
-uint16_t RPM, ref;
-uint16_t error = 0;
-uint8_t speed;
-uint16_t faults;*/
-
+// Motor sürücü
+MotorDriverData_t motor_rx_pkt;
 uint8_t driver_rx_buffer[DRIVER_RX_BUFFER_SIZE];
 uint8_t driver_rx_byte;
 volatile uint16_t driver_rx_index = 0;
@@ -182,22 +182,24 @@ uint16_t driver_error_code = 0;
 int RPM = 0;
 int ref = 0;
 uint8_t speed;
-uint16_t direction;
-MotorDriverData_t motor_rx_pkt;
 
+// NTC ve H2 (ADC)
 uint16_t driver_temp = 0;
 uint16_t motor_temp = 0;
-
+uint32_t adc_raw;
+float ntc_voltage;
 uint32_t h2_adc_value = 0;
+uint16_t adc2_dma_buffer[ADC2_BUFFER_SIZE];
 
+// Telemetri
 TelemetryPacket packet;
 const uint8_t ADDH = 0x07;
 const uint8_t ADDL = 0x60; // 9600 baud, 2.4k airrate
 const uint8_t CH = 0x1F;
 const uint8_t SPED = 0x1A;
-
 uint8_t config_cmd[] = { 0xC0, ADDH, ADDL, SPED, CH, 0xC0 };
 
+// Zamanlama değişkenleri
 uint32_t dataCurrentTime = 0;
 uint32_t dataLastTime = 0;
 uint32_t displayCurrentTime = 0;
@@ -205,28 +207,33 @@ uint32_t displayLastTime = 0;
 uint32_t buttonCurrentTime = 0;
 uint32_t buttonLastTime = 0;
 
+// BYS zamanlayıcılar
 static uint32_t bms_timer = 0;
 static uint32_t cell_timer = 0;
 static uint32_t ntc_timer = 0;
 
+// Direksiyon
 uint8_t buton_data[8];
 uint8_t buton_sinyal_right;
 uint8_t buton_sinyal_left;
 uint8_t buton_sinyal_hazard;
 uint8_t buton_sinyal_page;
 
+// Korna ve flaşör bayrak takibi
 bool korna = 0;
 bool flasor = 0;
-bool surucu = 0;
 
+// Şarj modu kontrolü
 bool charging = 0;
 bool charger_status = 0;
-HAL_StatusTypeDef st;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
+
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_DAC_Init(void);
 static void MX_USART2_UART_Init(void);
@@ -240,10 +247,31 @@ void vCanTask(void *argument);
 void vDisplayTask(void *argument);
 
 /* USER CODE BEGIN PFP */
+
+void Dwin_Send_Int(uint16_t adress, uint16_t data);
+void Dwin_Send_Float(uint16_t adress, float data);
+void Display_Startup_Animation();
+void Send_To_Display();
+void LoraMode();
+void TelemetryStart();
+void TelemetryData();
+void Send_Request_BMS();
+void Motor_Driver_Start();
+uint8_t Calculate_Checksum(uint8_t *data, uint16_t len);
+void Receive_Surucu();
+void Receive_BMS();
+void Receive_Direksiyon();
+void System_On();
+void Enable_Multiplexer();
+static void MUX_Select(uint8_t channel);
+uint16_t Read_ADC(ADC_HandleTypeDef *hadc, uint32_t channel);
+int16_t Raw_To_Temp();
 uint16_t Driver_Temperature(void);
 uint16_t Motor_Temperature(void);
-uint16_t Raw_To_Temp(void);
-void YSB_Send_Command(bool);
+void Horn_Flasher_Control();
+void Charge_Mode_Control();
+void YSB_Send_Command(bool charging);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -288,8 +316,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
 	if (hadc->Instance == ADC1) {
 		osSemaphoreRelease(adc1SemaphoreHandle);
-	} else if (hadc->Instance == ADC2) {
-		osSemaphoreRelease(adc2SemaphoreHandle);
 	}
 }
 
@@ -299,7 +325,6 @@ void Dwin_Send_Int(uint16_t adress, uint16_t data) {
 	buffer[6] = (data & 0xFF00) >> 8;
 	buffer[7] = data & 0xFF;
 
-	// main_3.c'deki çalışan doğrudan gönderim kodu
 	HAL_UART_Transmit(&huart2, buffer, 8, 20);
 }
 
@@ -325,9 +350,9 @@ void Dwin_Send_Float(uint16_t adress, float data) {
 	HAL_UART_Transmit(&huart2, buffer, 8, 20);
 }
 
-void Display_Startup_Animation(void) {
+void Display_Startup_Animation() {
 	HAL_GPIO_WritePin(LED8_GPIO_Port, LED8_Pin, GPIO_PIN_SET);
-	osDelay(500); // HAL_Delay yerine
+	osDelay(500);
 	for (int i = 0; i <= 60; i += 1) {
 		Dwin_Send_Int(0x5000, i);
 		Dwin_Send_Int(0x5100, i);
@@ -337,7 +362,7 @@ void Display_Startup_Animation(void) {
 		Dwin_Send_Int(0x5500, i);
 		Dwin_Send_Int(0x5600, i);
 		Dwin_Send_Int(0x5700, i);
-		osDelay(10); // HAL_Delay yerine
+		osDelay(10);
 	}
 	for (int i = 60; i >= 0; i -= 1) {
 		Dwin_Send_Int(0x5000, i);
@@ -354,7 +379,7 @@ void Display_Startup_Animation(void) {
 }
 
 void Send_To_Display() {
-	// 1. Ekran güncellemesinden hemen önce hücre verilerini analiz et
+	// Ekran güncellemesinden önce hücre verilerini analiz et
 	float toplam_hucre_voltaji = 0;
 	uint8_t okunan_hucre_sayisi = 0;
 
@@ -388,8 +413,7 @@ void Send_To_Display() {
 	// Hücre Voltajları için eski değerler
 	static float old_cells[14] = { 0.0 };
 	static uint16_t old_driver_error_code = 999;
-//    static uint8_t old_charge = 99;
-	static uint8_t old_battery_soc = 99;       	 // Şarj durumu
+	static uint8_t old_battery_soc = 99;
 
 	static int old_temp0 = -999;
 	static int old_temp1 = -999;
@@ -460,6 +484,13 @@ void Send_To_Display() {
 		Dwin_Send_Int(0x7600, RPM);
 		Dwin_Send_Int(0x8600, RPM);
 		old_RPM = RPM;
+	}
+
+	if (ref != old_ref) {
+		Dwin_Send_Int(0x5700, ref);
+		Dwin_Send_Int(0x7700, ref);
+		Dwin_Send_Int(0x8700, ref);
+		old_ref = ref;
 	}
 
 	// v1..v9 arası 7010..7090, v10..v14 arası 7100..7140
@@ -546,7 +577,7 @@ void TelemetryData() {
 	packet.crc = CRC_Calculate((uint8_t*) &packet, sizeof(TelemetryPacket) - 1);
 }
 
-void sendRequestBMS() {
+void Send_Request_BMS() {
 	if (HAL_GetTick() - bms_timer > 450) {
 		// Gönderme ID: Priority(0x18) + DataID(0x90) + BMS_Addr(0x01) + PC_Addr(0x40)
 		TxHeader.ExtId = 0x18900140;
@@ -579,24 +610,6 @@ void sendRequestBMS() {
 	}
 }
 
-/*void receiveSurucu(void) {
-	MotorControllerTxInformation[0] = RxHeader.StdId; // Sadece standart ID ise kaydet
-	MotorControllerTxInformation[1] = RxHeader.DLC;
-
-	if (RxHeader.StdId == 0x431) {
-		for (int i = 0; i < 8; i++) {
-			surucu_data[i] = RxData[i];
-		}
-
-		RPM = (surucu_data[0] << 8) | surucu_data[1];
-		speed = (uint8_t) (RPM * 3.14159 * 0.55 * 60 / 1000);
-		ref = surucu_data[2];
-		faults = (surucu_data[3] << 8) | surucu_data[4];
-
-		HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-	}
-}*/
-
 void Motor_Driver_Start(){
 	HAL_UART_Receive_IT(&huart1, &driver_rx_byte, 1);
 }
@@ -610,7 +623,7 @@ uint8_t Calculate_Checksum(uint8_t *data, uint16_t len) {
     return crc;
 }
 
-void receiveSurucuUART(void) {
+void Receive_Surucu() {
     uint8_t pkt_len = sizeof(MotorDriverData_t);
 
     // Buffer içerisinde paketi ara
@@ -644,7 +657,7 @@ void receiveSurucuUART(void) {
     }
 }
 
-void receiveBMS(void) {
+void Receive_BMS() {
 	// Kuyrukta mesaj varsa en eski mesajı okuyup "RxData" dizisine ve "RxHeader" yapısına aktar.
 	// Bu fonksiyon mesajı okur ve FIFO0'ı bir sonraki mesaj için boşaltır.
 	// Sadece Extended ID (BMS) mesajlarını kabul et
@@ -738,7 +751,7 @@ void receiveBMS(void) {
 	}
 }
 
-void recieveDireksiyon(void) {
+void Receive_Direksiyon(void) {
 
 	if (RxHeader.StdId == 0x46) {
 		DireksiyonTxInformation[0] = RxHeader.StdId; // Sadece standart ID ise kaydet
@@ -753,34 +766,18 @@ void recieveDireksiyon(void) {
 	}
 }
 
-void voltaCAN() {
-	while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0) {
-		if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
-
-			// Gelen verileri global değişkenlere yazmadan önce Mutex'i al (Maks 10ms bekle)
-			if (osMutexAcquire(dataMutexHandle, 10) == osOK) {
-
-				/*if (RxHeader.IDE == CAN_ID_STD) {
-					receiveSurucu();
-				} else*/ if (RxHeader.IDE == CAN_ID_EXT) {
-					receiveBMS();
-				}
-
-				// Yazma işlemi bitti, Mutex'i serbest bırak
-				osMutexRelease(dataMutexHandle);
-			}
-		}
-	}
-}
-
 void System_On() {
 //	Display_Startup_Animation();
+	// Preşarj devresini ve ardından motor sürücüyü açar
+	HAL_Delay(1000);
+	HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, 1); // ILK KONTAKTORU (DIRENCLI) AC
 	HAL_Delay(2000);
-	HAL_GPIO_WritePin(SELENOID_VALF_GPIO_Port, SELENOID_VALF_Pin, 1); // SURUCUYU AC
-	surucu = 1;
+	HAL_GPIO_WritePin(SELENOID_VALF_GPIO_Port, SELENOID_VALF_Pin, 1); // IKINCI KONTAKTORU (DIRENCSIZ) AC
+	HAL_Delay(2000);
+	HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, 0); // ILK KONTAKTORU (DIRENCLI) KAPAT
 }
 
-void Enable_Multiplexer(void) {
+void Enable_Multiplexer() {
 	HAL_GPIO_WritePin(MUX_EN_GPIO_Port, MUX_EN_Pin, GPIO_PIN_RESET);
 }
 
@@ -791,66 +788,76 @@ static void MUX_Select(uint8_t channel)
     HAL_GPIO_WritePin(MUX_S2_GPIO_Port, MUX_S2_Pin, (channel & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-uint16_t Read_ADC(ADC_HandleTypeDef hadc, uint32_t channel)
+uint16_t Read_ADC(ADC_HandleTypeDef *hadc, uint32_t channel)
 {
-    ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = channel;
-    sConfig.Rank = 1;
-    HAL_ADC_ConfigChannel(&hadc, &sConfig);
+	ADC_ChannelConfTypeDef sConfig = { 0 };
+	sConfig.Channel = channel;
+	sConfig.Rank = 1;
+	HAL_ADC_ConfigChannel(hadc, &sConfig);
 
-    HAL_ADC_Start(&hadc);
-    HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
-    HAL_ADC_Stop(&hadc1);
-    return HAL_ADC_GetValue(&hadc);
+	// ADC'yi IT (Kesme) modunda başlat
+	HAL_ADC_Start_IT(hadc);
+
+	// Dönüşümün bitmesini kesme ve semafor ile bekle (Maks 10ms)
+	if (osSemaphoreAcquire(adc1SemaphoreHandle, 10) != osOK) {
+		HAL_ADC_Stop_IT(hadc);
+		return 0xFFFF; // Hata / Timeout durumu
+	}
+
+	uint16_t value = HAL_ADC_GetValue(hadc);
+	return value;
+}
+
+int16_t Raw_To_Temp(){
+	adc_raw = Read_ADC(&hadc1, ADC_CHANNEL_9);
+
+	ntc_voltage = ((float) adc_raw / 4095.0f) * VCC;
+
+	// Pull-down devresi için NTC'nin o anki direncini hesapla (Gerilim bölücü formülü)
+	float r_ntc = R_PULLDOWN * ((4095.0f / (float) adc_raw) - 1.0f);
+
+	// Beta formülü ile sıcaklığı hesapla
+	float tempK = 1.0f / ((1.0f / T0) + (1.0f / BETA) * logf(r_ntc / R0));
+
+	// Celsius'a çevir
+	int16_t tempC = (int16_t) (tempK - 273.15f);
+	return tempC;
 }
 
 uint16_t Driver_Temperature(){
 	Enable_Multiplexer();
 	MUX_Select(0);
-	driver_temp = Raw_To_Temp();
-    return driver_temp;
+	osDelay(2);
+    return Raw_To_Temp();
 }
 
 uint16_t Motor_Temperature(){
 	Enable_Multiplexer();
 	MUX_Select(1);
-	motor_temp = Raw_To_Temp();
-    return motor_temp;
+	osDelay(2);
+	return Raw_To_Temp();
 }
 
-uint16_t Raw_To_Temp(){
-	uint32_t raw = Read_ADC(hadc1, ADC_CHANNEL_9);
-	float voltage = ((float) raw / 4095.0f) * VCC;
-
-	// Pull-down devresi için NTC direncini hesapla
-	float r_ntc = ((VCC * R_PULLDOWN) / voltage) - R_PULLDOWN;
-
-	// Beta formülü ile sıcaklığı hesapla
-	float tempK = 1.0f / ((1.0f / T0) + (1.0f / BETA) * logf(r_ntc / R0));
-	uint16_t temp = (uint16_t) (tempK - 273.15f);
-	return temp;
-}
-
-void Horn_Flasher_Control(void) {
+void Horn_Flasher_Control() {
 	uint8_t loc_max_temp = 0;
 
 	// Durumları takip etmek için static değişkenler (fonksiyondan çıkılsa bile değerini korur)
 	static uint8_t sequence_step = 0;
 	static uint32_t state_start_time = 0;
 
-	// RTOS'un o anki milisaniye cinsinden zamanını alıyoruz
+	// RTOS'un o anki milisaniye cinsinden zamanını al
 	uint32_t current_time = osKernelGetTickCount();
 
-	// Global değişkenden değeri güvenlice yerel değişkene al
+	// Global değişkenden değeri yerel değişkene al
 	if (osMutexAcquire(dataMutexHandle, 10) == osOK) {
 		loc_max_temp = max_temp;
 		osMutexRelease(dataMutexHandle);
 	}
 
-	//h2_adc_value = Read_ADC(hadc2, ADC_CHANNEL_4); // ADC’nin okuduğu dijital değeri (ölçülen analog sinyalin dijital karşılığını) al.
+	h2_adc_value = adc2_dma_buffer[0]; // ADC’nin okuduğu dijital değeri (ölçülen analog sinyalin dijital karşılığını) al.
 
-	// 1) SICAKLIK TEHLİKE SINIRINDAYSA UYARI DİZİSİNİ İŞLET
-	if ((loc_max_temp > 55 && loc_max_temp < 70) /*|| h2_adc_value > 200*/) {
+	// SICAKLIK TEHLİKE SINIRINDAYSA UYARI DİZİSİNİ İŞLET
+	if ((loc_max_temp > 55 && loc_max_temp < 70) || h2_adc_value > 200) {
 
 		switch (sequence_step) {
 		case 0: // Başlangıç durumu
@@ -903,7 +910,8 @@ void Horn_Flasher_Control(void) {
 			break;
 		}
 	}
-	// 2) SICAKLIK NORMALE DÖNDÜYSE SİSTEMİ SIFIRLA (Başlangıç durumuna dön)
+
+	// 2) SICAKLIK NORMALE DÖNDÜYSE BAŞLANGIÇ DURUMUNA DÖN
 	else if (loc_max_temp <= 55) {
 		HAL_GPIO_WritePin(FLASOR_GPIO_Port, FLASOR_Pin, 0);
 		HAL_GPIO_WritePin(KORNA_GPIO_Port, KORNA_Pin, 0);
@@ -912,17 +920,11 @@ void Horn_Flasher_Control(void) {
 		// Mod değişikliği durumunda ana devre yolunun sıfırlanması için adım 0'a çekilir
 		sequence_step = 0;
 	}
+
 	// 3) KRİTİK HATA (70 DERECE ÜSTÜ)
 	else {
-
-		 //Sıcaklık >= 70 ise burada sistemi kapatma işlemleri yapılabilir.
+		 // Sistemi kapat
 		 HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, 1);
-
-		/*flasor = 0;
-		korna = 0;
-		HAL_GPIO_WritePin(FLASOR_GPIO_Port, FLASOR_Pin, 0);
-		HAL_GPIO_WritePin(KORNA_GPIO_Port, KORNA_Pin, 0);
-		sequence_step = 0; // Olası bir sıcaklık düşüşü için makineyi hazır tut*/
 	}
 }
 
@@ -976,6 +978,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_DAC_Init();
   MX_USART2_UART_Init();
@@ -991,7 +994,7 @@ int main(void)
 	Motor_Driver_Start();
 	LoraMode();
 	TelemetryStart();
-
+	HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma_buffer, ADC2_BUFFER_SIZE);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -1031,7 +1034,7 @@ int main(void)
 	osSemaphoreAcquire(adc1SemaphoreHandle, 0);
 	osSemaphoreAcquire(uartTxSemaphoreHandle, 0);
 	osSemaphoreAcquire(alertSemaphoreHandle, 0);
-	osSemaphoreAcquire(adc2SemaphoreHandle, 0);
+	//osSemaphoreAcquire(adc2SemaphoreHandle, 0);
 	osSemaphoreAcquire(displayTxSemaphoreHandle, 0);
 	osSemaphoreAcquire(uart3RxSemaphoreHandle, 0);
 	osSemaphoreAcquire(uart1RxSemaphoreHandle, 0);
@@ -1170,7 +1173,7 @@ static void MX_ADC1_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV6;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -1190,7 +1193,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_9;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_112CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -1222,7 +1225,7 @@ static void MX_ADC2_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc2.Instance = ADC2;
-  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV6;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc2.Init.Resolution = ADC_RESOLUTION_12B;
   hadc2.Init.ScanConvMode = DISABLE;
   hadc2.Init.ContinuousConvMode = DISABLE;
@@ -1448,6 +1451,22 @@ static void MX_USART3_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -1461,7 +1480,6 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
@@ -1469,10 +1487,13 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, FLASOR_Pin|KORNA_Pin|SELENOID_VALF_Pin|YSB_Pin
                           |SISTEM_Pin|MUX_S0_Pin|MUX_S1_Pin|MUX_S2_Pin
-                          |MUX_EN_Pin|LED2_Pin|LED1_Pin, GPIO_PIN_RESET);
+                          |LED2_Pin|LED1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(MUX_EN_GPIO_Port, MUX_EN_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(RF_PARAMETRE_GPIO_Port, RF_PARAMETRE_Pin, GPIO_PIN_RESET);
@@ -1528,14 +1549,13 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 	if (hcan->Instance == CAN1) {
-		// DİKKAT: "if" yerine "while" kullanıyoruz. İçerideki tüm paketleri toplar.
+		// "if" yerine "while" kullanıyoruz. İçerideki tüm paketleri toplar.
 		while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
 			if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
 				/*if (RxHeader.IDE == CAN_ID_STD) {
-					receiveSurucu();
-//                    recieve_direksiyon();
+//                    Receive_Direksiyon();
 				} else */if (RxHeader.IDE == CAN_ID_EXT) {
-					receiveBMS();
+					Receive_BMS();
 				}
 			}
 		}
@@ -1556,11 +1576,11 @@ void vTelemetryTask(void *argument)
   /* USER CODE BEGIN 5 */
 	/* Infinite loop */
 	for (;;) {
-		TelemetryData();          // Verileri paketler
-		LoRa_PushPacket(&packet); // Kuyruğa ekler
-		LoRa_Run();         // ACK / Timeout / Gönderim durumlarını kontrol eder
+		TelemetryData();			// Verileri paketler
+		LoRa_PushPacket(&packet);	// Kuyruğa ekler
+		LoRa_Run();         		// ACK / Timeout / Gönderim durumlarını kontrol eder
 
-		osDelay(600);
+		osDelay(600);				// Görevi 600 ms uyut
 	}
   /* USER CODE END 5 */
 }
@@ -1579,9 +1599,7 @@ void vSafetyTask(void *argument)
 
 	for (;;) {
 		Horn_Flasher_Control();
-
-		// Periyodik bekleme (İşlemciyi diğer görevlere bırakır)
-		osDelay(50);
+		osDelay(50);	// Görevi 50 ms uyut
 	}
   /* USER CODE END vSafetyTask */
 }
@@ -1598,10 +1616,9 @@ void vCanTask(void *argument)
   /* USER CODE BEGIN vCanTask */
 	/* Infinite loop */
 	for (;;) {
-		sendRequestBMS(); // Periyodik BMS sorguları (Zamanlama takipleri içindedir)
-		//voltaCAN();       // FIFO'daki CAN mesajlarını okur
-		receiveSurucuUART();
-		osDelay(20);          // 20 ms Görevi Uyut
+		Send_Request_BMS(); // Periyodik BMS sorguları (Zamanlama takipleri içindedir)
+		Receive_Surucu();
+		osDelay(20);		// Görevi 20 ms uyut
 	}
   /* USER CODE END vCanTask */
 }
@@ -1620,7 +1637,7 @@ void vDisplayTask(void *argument)
 	/* Infinite loop */
 	for (;;) {
 		Send_To_Display();
-		osDelay(50); // 200 ms Görevi Uyut
+		osDelay(50);		// Görevi 50 ms uyut
 	}
   /* USER CODE END vDisplayTask */
 }
