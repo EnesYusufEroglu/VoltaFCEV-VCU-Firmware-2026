@@ -1,5 +1,5 @@
-#ifndef SENDAKS_DEF_H
-#define SENDAKS_DEF_H
+#ifndef RECEIVEDRIVER_DEF_H
+#define RECEIVEDRIVER_DEF_H
 
 #include <stdint.h>
 

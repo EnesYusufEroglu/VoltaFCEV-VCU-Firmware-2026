@@ -12,9 +12,9 @@
  ******************************************************************************
  * @file           : main.c
  * @project        : VoltaFCEV Vehicle Control Unit Firmware
- * @version        : 2.2.0 (FreeRTOS integrated)
+ * @version        : 2.3.0 (FreeRTOS integrated)
  * @author         : VCU TEAM
- * @date           : 17-08-2026
+ * @date           : 23-08-2026
  ******************************************************************************
  * @note
  * This firmware handles CAN communication with BMS, motor controller
@@ -31,6 +31,7 @@
 /* USER CODE BEGIN Includes */
 #include "string.h"
 #include "stdio.h"
+#include <stdbool.h>
 #include "ctype.h"
 #include "math.h"
 #include "stdlib.h"
@@ -40,6 +41,8 @@
 #include "queue.h"
 #include "semphr.h"
 #include "receiveDriver_def.h"
+#include "receiveButtons_def.h"
+#include "transmitDriver_def.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,6 +61,7 @@
 #define VCC         3.3f
 
 #define DRIVER_RX_BUFFER_SIZE 128
+#define BUTTONS_RX_BUFFER_SIZE 32
 
 #define ADC2_BUFFER_SIZE 1
 /* USER CODE END PD */
@@ -76,9 +80,11 @@ CAN_HandleTypeDef hcan1;
 
 DAC_HandleTypeDef hdac;
 
+UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+UART_HandleTypeDef huart6;
 
 /* Definitions for TelemetryTask */
 osThreadId_t TelemetryTaskHandle;
@@ -118,35 +124,40 @@ osSemaphoreId_t adc1SemaphoreHandle;
 const osSemaphoreAttr_t adc1Semaphore_attributes = {
   .name = "adc1Semaphore"
 };
-/* Definitions for uartTxSemaphore */
-osSemaphoreId_t uartTxSemaphoreHandle;
-const osSemaphoreAttr_t uartTxSemaphore_attributes = {
-  .name = "uartTxSemaphore"
+/* Definitions for uart3TxSemaphore */
+osSemaphoreId_t uart3TxSemaphoreHandle;
+const osSemaphoreAttr_t uart3TxSemaphore_attributes = {
+  .name = "uart3TxSemaphore"
 };
 /* Definitions for alertSemaphore */
 osSemaphoreId_t alertSemaphoreHandle;
 const osSemaphoreAttr_t alertSemaphore_attributes = {
   .name = "alertSemaphore"
 };
-/* Definitions for adc2Semaphore */
-osSemaphoreId_t adc2SemaphoreHandle;
-const osSemaphoreAttr_t adc2Semaphore_attributes = {
-  .name = "adc2Semaphore"
-};
-/* Definitions for displayTxSemaphore */
-osSemaphoreId_t displayTxSemaphoreHandle;
-const osSemaphoreAttr_t displayTxSemaphore_attributes = {
-  .name = "displayTxSemaphore"
+/* Definitions for uart2TxSemaphore */
+osSemaphoreId_t uart2TxSemaphoreHandle;
+const osSemaphoreAttr_t uart2TxSemaphore_attributes = {
+  .name = "uart2TxSemaphore"
 };
 /* Definitions for uart3RxSemaphore */
 osSemaphoreId_t uart3RxSemaphoreHandle;
 const osSemaphoreAttr_t uart3RxSemaphore_attributes = {
   .name = "uart3RxSemaphore"
 };
-/* Definitions for uart1RxSemaphore */
-osSemaphoreId_t uart1RxSemaphoreHandle;
-const osSemaphoreAttr_t uart1RxSemaphore_attributes = {
-  .name = "uart1RxSemaphore"
+/* Definitions for uart6RxSemaphore */
+osSemaphoreId_t uart6RxSemaphoreHandle;
+const osSemaphoreAttr_t uart6RxSemaphore_attributes = {
+  .name = "uart6RxSemaphore"
+};
+/* Definitions for uart5RxSemaphore */
+osSemaphoreId_t uart5RxSemaphoreHandle;
+const osSemaphoreAttr_t uart5RxSemaphore_attributes = {
+  .name = "uart5RxSemaphore"
+};
+/* Definitions for uart6TxSemaphore */
+osSemaphoreId_t uart6TxSemaphoreHandle;
+const osSemaphoreAttr_t uart6TxSemaphore_attributes = {
+  .name = "uart6TxSemaphore"
 };
 /* USER CODE BEGIN PV */
 
@@ -174,7 +185,8 @@ uint8_t min_temp = 0, max_temp = 0;
 uint16_t v_raw, i_raw, s_raw;
 
 // Motor sürücü
-MotorDriverData_t motor_rx_pkt;
+MotorDriverData_t driver_rx_pkt;
+VCUData_t driver_tx_pkt;
 uint8_t driver_rx_buffer[DRIVER_RX_BUFFER_SIZE];
 uint8_t driver_rx_byte;
 volatile uint16_t driver_rx_index = 0;
@@ -190,6 +202,7 @@ uint32_t adc_raw;
 float ntc_voltage;
 uint32_t h2_adc_value = 0;
 uint16_t adc2_dma_buffer[ADC2_BUFFER_SIZE];
+uint16_t h2_current;
 
 // Telemetri
 TelemetryPacket packet;
@@ -213,11 +226,28 @@ static uint32_t cell_timer = 0;
 static uint32_t ntc_timer = 0;
 
 // Direksiyon
-uint8_t buton_data[8];
+/*uint8_t buton_data[8];
 uint8_t buton_sinyal_right;
 uint8_t buton_sinyal_left;
 uint8_t buton_sinyal_hazard;
-uint8_t buton_sinyal_page;
+uint8_t buton_sinyal_page;*/
+
+uint8_t buttons_rx_byte;
+uint8_t buttons_rx_buffer[BUTTONS_RX_BUFFER_SIZE];
+uint8_t buttons_rx_index = 0;
+
+ButtonsData_t buttons_rx_pkt;
+
+uint8_t solSinyalButton = 0;
+uint8_t sagSinyalButton = 0;
+uint8_t dortluButton = 0;
+uint8_t resetButton = 0;
+uint8_t surucuKapatButton = 0;
+uint8_t sayfaDegistirButton= 0;
+uint8_t h2ArttirButton = 0;
+uint8_t h2AzaltButton = 0;
+uint8_t farButton = 0;
+int8_t currentPage = 0;
 
 // Korna ve flaşör bayrak takibi
 bool korna = 0;
@@ -230,7 +260,6 @@ bool charger_status = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
-
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
@@ -241,6 +270,8 @@ static void MX_USART3_UART_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_USART6_UART_Init(void);
+static void MX_UART5_Init(void);
 void vTelemetryTask(void *argument);
 void vSafetyTask(void *argument);
 void vCanTask(void *argument);
@@ -252,11 +283,12 @@ void Dwin_Send_Int(uint16_t adress, uint16_t data);
 void Dwin_Send_Float(uint16_t adress, float data);
 void Display_Startup_Animation();
 void Send_To_Display();
+void Send_Toggle_To_Display(uint16_t adress, uint16_t data);
 void LoraMode();
 void TelemetryStart();
 void TelemetryData();
 void Send_Request_BMS();
-void Motor_Driver_Start();
+void Driver_Receive_Start();
 uint8_t Calculate_Checksum(uint8_t *data, uint16_t len);
 void Receive_Surucu();
 void Receive_BMS();
@@ -271,6 +303,7 @@ uint16_t Motor_Temperature(void);
 void Horn_Flasher_Control();
 void Charge_Mode_Control();
 void YSB_Send_Command(bool charging);
+void Receive_Buttons(void);
 
 /* USER CODE END PFP */
 
@@ -278,7 +311,27 @@ void YSB_Send_Command(bool charging);
 /* USER CODE BEGIN 0 */
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart->Instance == USART1) { //SURUCU
+	if (huart->Instance == USART3) {
+		receivedCmd = receiveBuffer;
+		cmdReceivedFlag = true;
+
+		osSemaphoreRelease(uart3RxSemaphoreHandle);
+		HAL_UART_Receive_IT(&huart3, &receiveBuffer, 1);
+		HAL_GPIO_TogglePin(LED4_GPIO_Port, LED4_Pin); // Veri akışını gör
+	}
+	if (huart->Instance == UART5) {
+		buttons_rx_buffer[buttons_rx_index] = buttons_rx_byte;
+		buttons_rx_index++;
+
+		if (buttons_rx_index >= BUTTONS_RX_BUFFER_SIZE) {
+			buttons_rx_index = 0;
+		}
+
+		osSemaphoreRelease(uart5RxSemaphoreHandle);
+		HAL_UART_Receive_IT(&huart5, &buttons_rx_byte, 1);
+		HAL_GPIO_TogglePin(LED5_GPIO_Port, LED5_Pin); // Veri akışını gör
+	}
+	if (huart->Instance == USART6) { //SURUCU
 		// 1. Gelen baytı tampona yaz
 		driver_rx_buffer[driver_rx_index] = driver_rx_byte;
 		driver_rx_index++;
@@ -288,28 +341,26 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 			driver_rx_index = 0;
 		}
 
-		osSemaphoreRelease(uart1RxSemaphoreHandle);
+		osSemaphoreRelease(uart6RxSemaphoreHandle);
 		// 3. Kesmeyi yenile
-		HAL_UART_Receive_IT(&huart1, &driver_rx_byte, 1);
+		HAL_UART_Receive_IT(&huart6, &driver_rx_byte, 1);
 
-		HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin); // Veri akışını gör
-	}
-	if (huart->Instance == USART3) {
-		receivedCmd = receiveBuffer;
-		cmdReceivedFlag = true;
-
-		osSemaphoreRelease(uart3RxSemaphoreHandle);
-		HAL_UART_Receive_IT(&huart3, &receiveBuffer, 1);
+		HAL_GPIO_TogglePin(LED6_GPIO_Port, LED6_Pin); // Veri akışını gör
 	}
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == USART2) {
+		// DWIN Ekran UART gönderimi bittiğinde uyuyan görevi uyandır
+		osSemaphoreRelease(uart2TxSemaphoreHandle);
+	}
 	if (huart->Instance == USART3) {
 		// LoRa UART gönderimi (Tx) bittiğinde uyuyan görevi uyandır
-		osSemaphoreRelease(uartTxSemaphoreHandle);
-	} else if (huart->Instance == USART2) {
+		osSemaphoreRelease(uart3TxSemaphoreHandle);
+	}
+	if (huart->Instance == USART6) {
 		// DWIN Ekran UART gönderimi bittiğinde uyuyan görevi uyandır
-		osSemaphoreRelease(displayTxSemaphoreHandle);
+		osSemaphoreRelease(uart6TxSemaphoreHandle);
 	}
 }
 
@@ -380,8 +431,8 @@ void Display_Startup_Animation() {
 
 void Send_To_Display() {
 	// Ekran güncellemesinden önce hücre verilerini analiz et
-	float toplam_hucre_voltaji = 0;
-	uint8_t okunan_hucre_sayisi = 0;
+	float sum_voltage= 0;
+	uint8_t number_of_cells_read = 0;
 
 	min_cell_v = 5.0f; // Taramadan önce sıfırla
 	max_cell_v = 0.0f;
@@ -395,18 +446,18 @@ void Send_To_Display() {
 		if (cell_voltages[i] > max_cell_v)
 			max_cell_v = cell_voltages[i];
 
-		toplam_hucre_voltaji += cell_voltages[i];
-		okunan_hucre_sayisi++;
+		sum_voltage += cell_voltages[i];
+		number_of_cells_read++;
 	}
 
-	if (okunan_hucre_sayisi > 0) {
-		avg_cell_v = toplam_hucre_voltaji / okunan_hucre_sayisi;
+	if (number_of_cells_read > 0) {
+		avg_cell_v = sum_voltage / number_of_cells_read;
 	}
+
 	static int old_motor_temp = -999;
 	static int old_max_temp = -999;
 	static int old_driver_temp = -999;
 	static float old_battery_voltage = -999.0f;
-	static int old_RPM = -999;
 	static uint8_t old_speed = 255;
 	static uint16_t old_battery_current = 65535;
 	static int old_ref = -999;
@@ -417,43 +468,40 @@ void Send_To_Display() {
 
 	static int old_temp0 = -999;
 	static int old_temp1 = -999;
+	static int old_temp2 = -999;
+	static int old_temp3 = -999;
 	int temp0 = ntc_temperatures[0];
 	int temp1 = ntc_temperatures[1];
+	int temp2 = ntc_temperatures[2];
+	int temp3 = ntc_temperatures[3];
 
 	driver_temp = Driver_Temperature();
 	motor_temp = Motor_Temperature();
 
-	Dwin_Send_Int(0x5000, driver_error_code);
-	Dwin_Send_Int(0x5100, battery_soc);
-	Dwin_Send_Int(0x5200, battery_voltage);
-	Dwin_Send_Int(0x5300, battery_current);
-	Dwin_Send_Int(0x5400, speed);
-	Dwin_Send_Int(0x5500, max_temp);
-	Dwin_Send_Int(0x5600, RPM);
+	// 1. SAYFA
+	Dwin_Send_Int(0x5000, max_temp);
+	Send_Toggle_To_Display(0x5001, solSinyalButton);
+	Dwin_Send_Int(0x5002, dortluButton);
+	Send_Toggle_To_Display(0x5003, sagSinyalButton);
+	Send_Toggle_To_Display(0x5004, flasor);
+	Dwin_Send_Float(0x5100, battery_current);
+	Dwin_Send_Int(0x5200, max_temp);
+	Dwin_Send_Float(0x5300, h2_current);
+	Dwin_Send_Int(0x5400, motor_temp);
+	Dwin_Send_Int(0x5500, battery_voltage);
+	Dwin_Send_Int(0x5600, driver_temp);
+	Dwin_Send_Int(0x5700, speed);
+	Dwin_Send_Int(0x5800, ref);
+	Dwin_Send_Int(0x5900, battery_soc);
+	Dwin_Send_Int(0x5950, driver_error_code);
 
-	Dwin_Send_Int(0x7000, driver_error_code);
-	Dwin_Send_Int(0x7171, battery_soc);
-	Dwin_Send_Int(0x7200, battery_voltage);
-	Dwin_Send_Int(0x7400, speed);
-	Dwin_Send_Int(0x7600, RPM);
-
-	Dwin_Send_Int(0x8000, driver_error_code);
-	Dwin_Send_Int(0x8100, battery_soc);
-	Dwin_Send_Int(0x8200, battery_voltage);
-	Dwin_Send_Int(0x8400, speed);
-	Dwin_Send_Int(0x8600, RPM);
-
-	if (driver_error_code != old_driver_error_code) {
-		Dwin_Send_Int(0x5000, driver_error_code);
-		Dwin_Send_Int(0x7000, driver_error_code);
-		Dwin_Send_Int(0x8000, driver_error_code);
-		old_driver_error_code = driver_error_code;
-	}
+	// 2. SAYFA
+	Dwin_Send_Int(0x7900, battery_soc);
+	Dwin_Send_Int(0x7950, driver_error_code);
 
 	if (battery_soc != old_battery_soc) {
 		Dwin_Send_Int(0x5100, battery_soc);
 		Dwin_Send_Int(0x7171, battery_soc);
-		Dwin_Send_Int(0x8100, battery_soc);
 		old_battery_soc = battery_soc;
 	}
 
@@ -479,18 +527,15 @@ void Send_To_Display() {
 		old_max_temp = max_temp;
 	}
 
-	if (RPM != old_RPM) {
-		Dwin_Send_Int(0x5600, RPM);
-		Dwin_Send_Int(0x7600, RPM);
-		Dwin_Send_Int(0x8600, RPM);
-		old_RPM = RPM;
+	if (ref != old_ref) {
+		Dwin_Send_Int(0x5800, ref);
+		old_ref = ref;
 	}
 
-	if (ref != old_ref) {
-		Dwin_Send_Int(0x5700, ref);
-		Dwin_Send_Int(0x7700, ref);
-		Dwin_Send_Int(0x8700, ref);
-		old_ref = ref;
+	if (driver_error_code != old_driver_error_code) {
+		Dwin_Send_Int(0x5950, driver_error_code);
+		Dwin_Send_Int(0x7950, driver_error_code);
+		old_driver_error_code = driver_error_code;
 	}
 
 	// v1..v9 arası 7010..7090, v10..v14 arası 7100..7140
@@ -508,16 +553,18 @@ void Send_To_Display() {
 	Dwin_Send_Float(0x7300, min_cell_v);
 	old_min_cell = min_cell_v;
 
+	Dwin_Send_Float(0x7310, battery_voltage);
+
 	Dwin_Send_Float(0x7320, max_cell_v);
 	old_max_cell = max_cell_v;
 
-	Dwin_Send_Int(0x8201, temp0);
-	Dwin_Send_Int(0x8202, temp1);
-	Dwin_Send_Int(0x8203, driver_temp);
-	Dwin_Send_Int(0x8204, motor_temp);
+	Dwin_Send_Int(0x7771, temp0);
+	Dwin_Send_Int(0x7772, temp1);
+	Dwin_Send_Int(0x7773, temp2);
+	Dwin_Send_Int(0x7774, temp3);
 
 	if (temp0 != old_temp0) {
-		Dwin_Send_Int(0x8201, temp0);
+		Dwin_Send_Int(0x7771, temp0);
 		old_temp0 = temp0;
 	}
 
@@ -535,6 +582,49 @@ void Send_To_Display() {
 		Dwin_Send_Int(0x8204, motor_temp);
         old_motor_temp = motor_temp;
     }
+}
+
+void Send_Toggle_To_Display(uint16_t adress, uint16_t data) {
+	static uint8_t sequence_step = 0;
+	uint32_t state_start_time = 0;
+	uint32_t current_time = osKernelGetTickCount();
+	Dwin_Send_Int(adress, data);
+
+	if (solSinyalButton == 1) {
+		switch (sequence_step) {
+		case 0: // Başlangıç durumu
+			Dwin_Send_Int(adress, 1);
+			state_start_time = current_time; // Zamanlayıcıyı başlat
+			sequence_step = 1;               // Bir sonraki adıma geç
+			break;
+		case 1: // Kapatmak için 2000 ms bekle
+			if ((current_time - state_start_time) >= 1000) {
+				Dwin_Send_Int(adress, 0);
+				state_start_time = current_time;
+				sequence_step = 2;
+			}
+			break;
+		case 2: // Açmak için 1000 ms bekle
+			if ((current_time - state_start_time) >= 1000) {
+				Dwin_Send_Int(adress, 1);
+				state_start_time = current_time;
+				sequence_step = 3;
+			}
+			break;
+		case 3: // Kapatmak için 2000 ms bekle
+			if ((current_time - state_start_time) >= 1000) {
+				Dwin_Send_Int(adress, 0);
+				state_start_time = current_time;
+				sequence_step = 4;
+			}
+			break;
+		case 4: // Diziyi başa sarmak için 1000 ms bekle
+			if ((current_time - state_start_time) >= 1000) {
+				sequence_step = 0;
+			}
+			break;
+		}
+	}
 }
 
 void LoraMode() {
@@ -610,8 +700,8 @@ void Send_Request_BMS() {
 	}
 }
 
-void Motor_Driver_Start(){
-	HAL_UART_Receive_IT(&huart1, &driver_rx_byte, 1);
+void Driver_Receive_Start(){
+	HAL_UART_Receive_IT(&huart6, &driver_rx_byte, 1);
 }
 
 // Basit Checksum Hesaplayıcı
@@ -640,12 +730,12 @@ void Receive_Surucu() {
 
             if (calc_crc == rx_crc) {
                 // 3. Veri Doğru! Doğrudan Struct'a kopyala
-                memcpy(&motor_rx_pkt, &driver_rx_buffer[i], pkt_len);
+                memcpy(&driver_rx_pkt, &driver_rx_buffer[i], pkt_len);
 
                 // Global değişkenlerinize doğrudan aktarın
-                RPM = motor_rx_pkt.rpm;
-                ref = motor_rx_pkt.reference;
-                driver_error_code = motor_rx_pkt.faults;
+                RPM = driver_rx_pkt.rpm;
+                ref = driver_rx_pkt.reference;
+                driver_error_code = driver_rx_pkt.faults;
 
                 // Hız hesaplama
                 speed = (uint16_t)(RPM * 3.14159f * 0.55f * 60.0f / 1000.0f);
@@ -751,19 +841,17 @@ void Receive_BMS() {
 	}
 }
 
-void Receive_Direksiyon(void) {
+void Transmit_Motor_Driver(void) {
+    // Struct doldurma
+    driver_tx_pkt.sof = MOTOR_DRIVER_SOF;
+	driver_tx_pkt.driver_reset = (uint16_t) resetButton;
+	driver_tx_pkt.engine_off = (uint16_t) surucuKapatButton;
 
-	if (RxHeader.StdId == 0x46) {
-		DireksiyonTxInformation[0] = RxHeader.StdId; // Sadece standart ID ise kaydet
-		DireksiyonTxInformation[1] = RxHeader.DLC;
+    // Checksum hesapla (SOF'tan faults'a kadar olan alanlar)
+    driver_tx_pkt.crc = Calculate_Checksum((uint8_t*)&driver_tx_pkt, sizeof(VCUData_t) - 1);
 
-		buton_sinyal_right = RxData[0];
-		buton_sinyal_left = RxData[1];
-		buton_sinyal_hazard = RxData[2];
-		buton_sinyal_page = RxData[3];
-		//buton_sinyal_korna = RxData[5];
-		memcpy(buton_data, RxData, 8);
-	}
+    // Paketi tek seferde binary olarak gönder
+    HAL_UART_Transmit_IT(&huart6, (uint8_t*)&driver_tx_pkt, sizeof(VCUData_t));
 }
 
 void System_On() {
@@ -772,7 +860,7 @@ void System_On() {
 	HAL_Delay(1000);
 	HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, 1); // ILK KONTAKTORU (DIRENCLI) AC
 	HAL_Delay(2000);
-	HAL_GPIO_WritePin(SELENOID_VALF_GPIO_Port, SELENOID_VALF_Pin, 1); // IKINCI KONTAKTORU (DIRENCSIZ) AC
+	HAL_GPIO_WritePin(YSB_GPIO_Port, YSB_Pin, 1); // IKINCI KONTAKTORU (DIRENCSIZ) AC
 	HAL_Delay(2000);
 	HAL_GPIO_WritePin(YEDEK_GPIO_Port, YEDEK_Pin, 0); // ILK KONTAKTORU (DIRENCLI) KAPAT
 }
@@ -810,6 +898,10 @@ uint16_t Read_ADC(ADC_HandleTypeDef *hadc, uint32_t channel)
 
 int16_t Raw_To_Temp(){
 	adc_raw = Read_ADC(&hadc1, ADC_CHANNEL_9);
+
+	if (adc_raw == 0 || adc_raw >= 4095 || adc_raw == 0xFFFF) {
+		return -999;
+	}
 
 	ntc_voltage = ((float) adc_raw / 4095.0f) * VCC;
 
@@ -854,7 +946,7 @@ void Horn_Flasher_Control() {
 		osMutexRelease(dataMutexHandle);
 	}
 
-	h2_adc_value = adc2_dma_buffer[0]; // ADC’nin okuduğu dijital değeri (ölçülen analog sinyalin dijital karşılığını) al.
+	//h2_adc_value = adc2_dma_buffer[0]; // ADC’nin okuduğu dijital değeri (ölçülen analog sinyalin dijital karşılığını) al.
 
 	// SICAKLIK TEHLİKE SINIRINDAYSA UYARI DİZİSİNİ İŞLET
 	if ((loc_max_temp > 55 && loc_max_temp < 70) || h2_adc_value > 200) {
@@ -947,6 +1039,45 @@ void YSB_Send_Command(bool charging) {
 	HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox);
 }
 
+void Direksiyon_Receive_Start() {
+	HAL_UART_Receive_IT(&huart5, &buttons_rx_byte, 1);
+}
+
+void Receive_Buttons() {
+	uint8_t pkt_len = sizeof(ButtonsData_t);
+
+	if (buttons_rx_index < pkt_len) {
+		return;
+	}
+
+	for (int i = 0; i <= buttons_rx_index - pkt_len; i++) {
+
+		if (buttons_rx_buffer[i] == BUTTONS_SOF) {
+
+			uint8_t calc_crc = Calculate_Checksum(&buttons_rx_buffer[i], pkt_len - 1);
+			uint8_t received_crc = buttons_rx_buffer[i + pkt_len - 1];
+
+			if (calc_crc == received_crc) {
+				memcpy(&buttons_rx_pkt, &buttons_rx_buffer[i], pkt_len);
+
+				solSinyalButton = buttons_rx_pkt.solSinyal;
+				sagSinyalButton = buttons_rx_pkt.sagSinyal;
+				dortluButton = buttons_rx_pkt.dortlu;
+				resetButton = buttons_rx_pkt.reset;
+				surucuKapatButton = buttons_rx_pkt.surucuKapat;
+				sayfaDegistirButton = buttons_rx_pkt.sayfaDegistir;
+				farButton = buttons_rx_pkt.far;
+				h2ArttirButton = buttons_rx_pkt.h2Arttir;
+				h2AzaltButton = buttons_rx_pkt.h2Azalt;
+
+				buttons_rx_index = 0;
+				break;
+			}
+		}
+	}
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -986,12 +1117,15 @@ int main(void)
   MX_ADC2_Init();
   MX_CAN1_Init();
   MX_USART1_UART_Init();
+  MX_USART6_UART_Init();
+  MX_UART5_Init();
   /* USER CODE BEGIN 2 */
 	System_On();
 	//Display_Startup_Animation();
 	HAL_CAN_Start(&hcan1);
 	HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-	Motor_Driver_Start();
+	Driver_Receive_Start();
+	Direksiyon_Receive_Start();
 	LoraMode();
 	TelemetryStart();
 	HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_dma_buffer, ADC2_BUFFER_SIZE);
@@ -1011,33 +1145,39 @@ int main(void)
   /* creation of adc1Semaphore */
   adc1SemaphoreHandle = osSemaphoreNew(1, 1, &adc1Semaphore_attributes);
 
-  /* creation of uartTxSemaphore */
-  uartTxSemaphoreHandle = osSemaphoreNew(1, 1, &uartTxSemaphore_attributes);
+  /* creation of uart3TxSemaphore */
+  uart3TxSemaphoreHandle = osSemaphoreNew(1, 1, &uart3TxSemaphore_attributes);
 
   /* creation of alertSemaphore */
   alertSemaphoreHandle = osSemaphoreNew(1, 1, &alertSemaphore_attributes);
 
-  /* creation of adc2Semaphore */
-  adc2SemaphoreHandle = osSemaphoreNew(1, 1, &adc2Semaphore_attributes);
-
-  /* creation of displayTxSemaphore */
-  displayTxSemaphoreHandle = osSemaphoreNew(1, 1, &displayTxSemaphore_attributes);
+  /* creation of uart2TxSemaphore */
+  uart2TxSemaphoreHandle = osSemaphoreNew(1, 1, &uart2TxSemaphore_attributes);
 
   /* creation of uart3RxSemaphore */
   uart3RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart3RxSemaphore_attributes);
 
-  /* creation of uart1RxSemaphore */
-  uart1RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart1RxSemaphore_attributes);
+  /* creation of uart6RxSemaphore */
+  uart6RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart6RxSemaphore_attributes);
+
+  /* creation of uart5RxSemaphore */
+  uart5RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart5RxSemaphore_attributes);
+
+  /* creation of uart6TxSemaphore */
+  uart6TxSemaphoreHandle = osSemaphoreNew(1, 1, &uart6TxSemaphore_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
 	// görevler (tasks) başlamadan önce içlerini "boşaltıyoruz".
 	osSemaphoreAcquire(adc1SemaphoreHandle, 0);
-	osSemaphoreAcquire(uartTxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart3TxSemaphoreHandle, 0);
 	osSemaphoreAcquire(alertSemaphoreHandle, 0);
 	//osSemaphoreAcquire(adc2SemaphoreHandle, 0);
-	osSemaphoreAcquire(displayTxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart2TxSemaphoreHandle, 0);
 	osSemaphoreAcquire(uart3RxSemaphoreHandle, 0);
-	osSemaphoreAcquire(uart1RxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart6RxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart5RxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart6TxSemaphoreHandle, 0);
+
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -1352,6 +1492,39 @@ static void MX_DAC_Init(void)
 }
 
 /**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 115200;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART5_Init 2 */
+
+  /* USER CODE END UART5_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -1447,6 +1620,39 @@ static void MX_USART3_UART_Init(void)
   /* USER CODE BEGIN USART3_Init 2 */
 
   /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief USART6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART6_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART6_Init 0 */
+
+  /* USER CODE END USART6_Init 0 */
+
+  /* USER CODE BEGIN USART6_Init 1 */
+
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART6_Init 2 */
+
+  /* USER CODE END USART6_Init 2 */
 
 }
 
@@ -1618,6 +1824,7 @@ void vCanTask(void *argument)
 	for (;;) {
 		Send_Request_BMS(); // Periyodik BMS sorguları (Zamanlama takipleri içindedir)
 		Receive_Surucu();
+		Receive_Buttons();
 		osDelay(20);		// Görevi 20 ms uyut
 	}
   /* USER CODE END vCanTask */

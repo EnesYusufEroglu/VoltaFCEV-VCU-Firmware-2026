@@ -3,7 +3,7 @@
 #include "cmsis_os.h"  // RTOS ve Semafor fonksiyonları için gerekli
 
 extern UART_HandleTypeDef huart3;
-extern osSemaphoreId_t uartTxSemaphoreHandle; // main.c'den gelen semafor
+extern osSemaphoreId_t uart3TxSemaphoreHandle; // main.c'den gelen semafor
 
 uint8_t receiveBuffer;
 TelemetryPacket telemetryQueue[QUEUE_SIZE];
@@ -86,7 +86,7 @@ void LoRa_SendNextPacket(void)
 
 	if (HAL_UART_Transmit_IT(&huart3, txBuffer, sizeof(txBuffer)) == HAL_OK) {
 		// İletim süresince görevi (Task) beklemeye alıyoruz ki CPU serbest kalsın
-		if (osSemaphoreAcquire(uartTxSemaphoreHandle, 100) == osOK) {
+		if (osSemaphoreAcquire(uart3TxSemaphoreHandle, 100) == osOK) {
 			waitingAck = true;
 			lastSendTime = HAL_GetTick();
 		}
@@ -110,7 +110,7 @@ void LoRa_ResendPacket(void)
 	// Bloking transmit YERİNE, IT ve Semafor kullanıyoruz
 	if (HAL_UART_Transmit_IT(&huart3, txBuffer, sizeof(txBuffer)) == HAL_OK) {
 		// CPU'yu bloklamadan iletimin (Tx) bitmesini bekliyoruz (Maks 600ms)
-		if (osSemaphoreAcquire(uartTxSemaphoreHandle, 600) == osOK) {
+		if (osSemaphoreAcquire(uart3TxSemaphoreHandle, 600) == osOK) {
 			waitingAck = true;
 			lastSendTime = HAL_GetTick();
 		}
