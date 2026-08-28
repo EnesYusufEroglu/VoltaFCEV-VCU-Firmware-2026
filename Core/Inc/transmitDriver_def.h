@@ -11,6 +11,6 @@ typedef struct __attribute__((packed)) {
     uint8_t driver_reset;
     uint8_t engine_off;
     uint8_t crc;        // Basit Checksum / CRC
-} VCUData_t;
+} VcuToDriver_Data_t;
 
 #endif

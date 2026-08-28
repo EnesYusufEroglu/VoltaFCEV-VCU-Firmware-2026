@@ -12,6 +12,6 @@ typedef struct __attribute__((packed)) {
     uint16_t reference;  // Gaz Referansı
     uint16_t faults;     // Hata Kodları (Bitmask)
     uint8_t  crc;        // Basit Checksum / CRC
-} MotorDriverData_t;
+} DriverToVcu_Data_t;
 
 #endif

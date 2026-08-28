@@ -18,6 +18,6 @@ typedef struct __attribute__((packed))
 	    uint8_t surucuKapat;
 	    uint8_t sayfaDegistir;
 	    uint8_t crc;
-} ButtonsData_t;
+} Buttons_Data_t;
 
 #endif

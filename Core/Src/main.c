@@ -12,9 +12,9 @@
  ******************************************************************************
  * @file           : main.c
  * @project        : VoltaFCEV Vehicle Control Unit Firmware
- * @version        : 2.3.0 (FreeRTOS integrated)
+ * @version        : 2.4.0 (FreeRTOS integrated)
  * @author         : VCU TEAM
- * @date           : 23-08-2026
+ * @date           : 28-08-2026
  ******************************************************************************
  * @note
  * This firmware handles CAN communication with BMS, motor controller
@@ -41,8 +41,10 @@
 #include "queue.h"
 #include "semphr.h"
 #include "receiveDriver_def.h"
-#include "receiveButtons_def.h"
 #include "transmitDriver_def.h"
+#include "receiveButtons_def.h"
+#include "receiveH2_def.h"
+#include "transmitH2_def.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,10 +62,15 @@
 #define R_PULLDOWN	10000.0f	// Karttaki R4-R11 seri pull-down dirençleri (10k)
 #define VCC         3.3f
 
-#define DRIVER_RX_BUFFER_SIZE 128
+#define DRIVER_RX_BUFFER_SIZE 80
 #define BUTTONS_RX_BUFFER_SIZE 32
+#define H2_RX_BUFFER_SIZE 64
 
 #define ADC2_BUFFER_SIZE 1
+
+#define MIN_PAGE 0
+#define MAX_PAGE 1
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -80,6 +87,7 @@ CAN_HandleTypeDef hcan1;
 
 DAC_HandleTypeDef hdac;
 
+UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
@@ -100,10 +108,10 @@ const osThreadAttr_t SafetyTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityRealtime,
 };
-/* Definitions for CanTask */
-osThreadId_t CanTaskHandle;
-const osThreadAttr_t CanTask_attributes = {
-  .name = "CanTask",
+/* Definitions for CommunicationTa */
+osThreadId_t CommunicationTaHandle;
+const osThreadAttr_t CommunicationTa_attributes = {
+  .name = "CommunicationTa",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
@@ -159,6 +167,21 @@ osSemaphoreId_t uart6TxSemaphoreHandle;
 const osSemaphoreAttr_t uart6TxSemaphore_attributes = {
   .name = "uart6TxSemaphore"
 };
+/* Definitions for uart1RxSemaphore */
+osSemaphoreId_t uart1RxSemaphoreHandle;
+const osSemaphoreAttr_t uart1RxSemaphore_attributes = {
+  .name = "uart1RxSemaphore"
+};
+/* Definitions for uart4RxSemaphore */
+osSemaphoreId_t uart4RxSemaphoreHandle;
+const osSemaphoreAttr_t uart4RxSemaphore_attributes = {
+  .name = "uart4RxSemaphore"
+};
+/* Definitions for uart4TxSemaphore */
+osSemaphoreId_t uart4TxSemaphoreHandle;
+const osSemaphoreAttr_t uart4TxSemaphore_attributes = {
+  .name = "uart4TxSemaphore"
+};
 /* USER CODE BEGIN PV */
 
 CAN_TxHeaderTypeDef TxHeader;
@@ -170,6 +193,10 @@ uint32_t MotorControllerTxInformation[5];
 uint32_t BMSTxInformation[5];
 uint8_t DireksiyonTxInformation[5];
 
+CAN_TxHeaderTypeDef h2TxHeader;
+uint8_t h2TxData[8];
+uint32_t h2TxMailbox;
+
 // Ekran
 uint8_t buffer[9] = { 0x5A, 0xA5, 0x05, 0x82 };
 float kusurat;
@@ -180,16 +207,21 @@ float battery_voltage = 0;		// Toplam paket voltajı
 int16_t battery_current = 0;	// Anlık akım
 uint8_t battery_soc = 0;		// Şarj durumu
 float cell_voltages[48];		// Her hücrenin voltajı
-float ntc_temperatures[2];
+float ntc_temperatures[4];
+int temp0;
+int temp1;
+int temp2;
+int temp3;
 uint8_t min_temp = 0, max_temp = 0;
 uint16_t v_raw, i_raw, s_raw;
 
 // Motor sürücü
-MotorDriverData_t driver_rx_pkt;
-VCUData_t driver_tx_pkt;
+DriverToVcu_Data_t driver_rx_pkt;
+VcuToDriver_Data_t driver_tx_pkt;
 uint8_t driver_rx_buffer[DRIVER_RX_BUFFER_SIZE];
 uint8_t driver_rx_byte;
 volatile uint16_t driver_rx_index = 0;
+
 uint16_t driver_error_code = 0;
 int RPM = 0;
 int ref = 0;
@@ -202,7 +234,16 @@ uint32_t adc_raw;
 float ntc_voltage;
 uint32_t h2_adc_value = 0;
 uint16_t adc2_dma_buffer[ADC2_BUFFER_SIZE];
-uint16_t h2_current;
+
+// H2 kartı
+H2ToVcu_Data_t h2_rx_pkt;
+VcuToH2_Data_t h2_tx_pkt;
+uint8_t h2_rx_buffer[H2_RX_BUFFER_SIZE];
+uint8_t h2_rx_byte;
+volatile uint16_t h2_rx_index = 0;
+
+float h2_current = 0.0f;
+float h2_temp = 0.0f;
 
 // Telemetri
 TelemetryPacket packet;
@@ -224,19 +265,14 @@ uint32_t buttonLastTime = 0;
 static uint32_t bms_timer = 0;
 static uint32_t cell_timer = 0;
 static uint32_t ntc_timer = 0;
+static uint32_t ysb_timer = 0;
+static uint32_t h2_timer = 0;
 
 // Direksiyon
-/*uint8_t buton_data[8];
-uint8_t buton_sinyal_right;
-uint8_t buton_sinyal_left;
-uint8_t buton_sinyal_hazard;
-uint8_t buton_sinyal_page;*/
-
-uint8_t buttons_rx_byte;
+Buttons_Data_t buttons_rx_pkt;
 uint8_t buttons_rx_buffer[BUTTONS_RX_BUFFER_SIZE];
-uint8_t buttons_rx_index = 0;
-
-ButtonsData_t buttons_rx_pkt;
+uint8_t buttons_rx_byte;
+volatile uint8_t buttons_rx_index = 0;
 
 uint8_t solSinyalButton = 0;
 uint8_t sagSinyalButton = 0;
@@ -257,6 +293,21 @@ bool flasor = 0;
 bool charging = 0;
 bool charger_status = 0;
 
+// YŞB'ye gönderilen komutlar
+float user_voltage = 55.0f;
+float user_current = 20.0f;
+uint8_t user_charge = 0;
+
+// YŞB'den alınan veriler
+float YSB_Voltage = 0.0f;
+float YSB_Current = 0.0f;
+uint8_t YSB_Status = 0;
+uint8_t YSB_HardwareFault = 0;
+uint8_t YSB_TemperatureFault = 0;
+uint8_t YSB_InputVoltageFault = 0;
+uint8_t YSB_BatteryFault = 0;
+uint8_t YSB_CommunicationFault = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -272,18 +323,21 @@ static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_UART5_Init(void);
+static void MX_UART4_Init(void);
 void vTelemetryTask(void *argument);
 void vSafetyTask(void *argument);
-void vCanTask(void *argument);
+void vCommunicationTask(void *argument);
 void vDisplayTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
 void Dwin_Send_Int(uint16_t adress, uint16_t data);
 void Dwin_Send_Float(uint16_t adress, float data);
+void DWIN_SetPage(uint16_t page_id);
 void Display_Startup_Animation();
+void Start_Display(void);
 void Send_To_Display();
-void Send_Toggle_To_Display(uint16_t adress, uint16_t data);
+void Send_Signals_To_Display();
 void LoraMode();
 void TelemetryStart();
 void TelemetryData();
@@ -304,6 +358,8 @@ void Horn_Flasher_Control();
 void Charge_Mode_Control();
 void YSB_Send_Command(bool charging);
 void Receive_Buttons(void);
+void Charger_Send_Command(float voltage, float current, uint8_t charge);
+void Receive_YSB(void);
 
 /* USER CODE END PFP */
 
@@ -317,7 +373,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
 		osSemaphoreRelease(uart3RxSemaphoreHandle);
 		HAL_UART_Receive_IT(&huart3, &receiveBuffer, 1);
-		HAL_GPIO_TogglePin(LED4_GPIO_Port, LED4_Pin); // Veri akışını gör
+		HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin); // Veri akışını gör
 	}
 	if (huart->Instance == UART5) {
 		buttons_rx_buffer[buttons_rx_index] = buttons_rx_byte;
@@ -347,6 +403,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
 		HAL_GPIO_TogglePin(LED6_GPIO_Port, LED6_Pin); // Veri akışını gör
 	}
+	if (huart->Instance == UART4) {	// H2 KARTI CAN İLE HABERLEŞECEK BU KISIM İPTAL
+		h2_rx_buffer[h2_rx_index] = h2_rx_byte;
+		h2_rx_index++;
+
+		if (h2_rx_index >= H2_RX_BUFFER_SIZE) {
+			h2_rx_index = 0;
+		}
+
+		osSemaphoreRelease(uart4RxSemaphoreHandle);
+		HAL_UART_Receive_IT(&huart4, &h2_rx_byte, 1);
+		HAL_GPIO_TogglePin(LED4_GPIO_Port, LED4_Pin); // H2 veri akış ledi
+	}
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
@@ -359,8 +427,12 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
 		osSemaphoreRelease(uart3TxSemaphoreHandle);
 	}
 	if (huart->Instance == USART6) {
-		// DWIN Ekran UART gönderimi bittiğinde uyuyan görevi uyandır
+		// Motor sürücü UART gönderimi bittiğinde uyuyan görevi uyandır
 		osSemaphoreRelease(uart6TxSemaphoreHandle);
+	}
+	if (huart->Instance == UART4) {
+		// H2 kartı UART gönderimi bittiğinde uyuyan görevi uyandır
+		osSemaphoreRelease(uart4TxSemaphoreHandle);
 	}
 }
 
@@ -401,6 +473,19 @@ void Dwin_Send_Float(uint16_t adress, float data) {
 	HAL_UART_Transmit(&huart2, buffer, 8, 20);
 }
 
+void DWIN_SetPage(uint16_t page_id) {
+    uint8_t command[10] = {
+        0x5A, 0xA5,               // Frame header
+        0x07,                     // Data length
+        0x82,                     // Write instruction
+        0x00, 0x84,               // Sayfa geçiş adresi (0x0084)
+        0x5A, 0x01,               // Sabit — sayfa işlemini başlat
+        (uint8_t)(page_id >> 8),  // Page ID high byte
+        (uint8_t)(page_id & 0xFF) // Page ID low byte
+    };
+    HAL_UART_Transmit(&huart2, command, 10, 100);
+}
+
 void Display_Startup_Animation() {
 	HAL_GPIO_WritePin(LED8_GPIO_Port, LED8_Pin, GPIO_PIN_SET);
 	osDelay(500);
@@ -429,7 +514,40 @@ void Display_Startup_Animation() {
 	HAL_GPIO_WritePin(LED8_GPIO_Port, LED8_Pin, GPIO_PIN_RESET);
 }
 
+void Start_Display(){
+	// 1. SAYFA
+	Send_Signals_To_Display();
+	Dwin_Send_Int(0x5100, battery_current);
+	Dwin_Send_Int(0x5200, max_temp);
+	Dwin_Send_Int(0x5300, h2_current);
+	Dwin_Send_Int(0x5400, motor_temp);
+	Dwin_Send_Int(0x5500, battery_voltage);
+	Dwin_Send_Int(0x5600, driver_temp);
+	Dwin_Send_Int(0x5700, speed);
+	Dwin_Send_Int(0x5800, ref);
+	Dwin_Send_Int(0x5900, battery_soc);
+	Dwin_Send_Int(0x5950, driver_error_code);
+
+	// 2. SAYFA
+	Dwin_Send_Float(0x7300, min_cell_v);
+	Dwin_Send_Float(0x7310, battery_voltage);
+	Dwin_Send_Float(0x7320, max_cell_v);
+	Dwin_Send_Int(0x7771, temp0);
+	Dwin_Send_Int(0x7772, temp1);
+	Dwin_Send_Int(0x7773, temp2);
+	Dwin_Send_Int(0x7774, temp3);
+	Dwin_Send_Int(0x7900, battery_soc);
+	Dwin_Send_Int(0x7950, driver_error_code);
+}
+
 void Send_To_Display() {
+	if (sayfaDegistirButton == 1) {
+		currentPage++;
+		if (currentPage > MAX_PAGE) currentPage = MIN_PAGE;
+		DWIN_SetPage(currentPage);
+		sayfaDegistirButton = 0;
+	}
+
 	// Ekran güncellemesinden önce hücre verilerini analiz et
 	float sum_voltage= 0;
 	uint8_t number_of_cells_read = 0;
@@ -454,84 +572,75 @@ void Send_To_Display() {
 		avg_cell_v = sum_voltage / number_of_cells_read;
 	}
 
+	// Sıcaklık ölçümleri
+	driver_temp = Driver_Temperature();
+	motor_temp = Motor_Temperature();
+
+	// Değişim takibi için static değişkenler
 	static int old_motor_temp = -999;
 	static int old_max_temp = -999;
 	static int old_driver_temp = -999;
 	static float old_battery_voltage = -999.0f;
 	static uint8_t old_speed = 255;
 	static uint16_t old_battery_current = 65535;
+	static uint16_t old_h2_current = 65535;
 	static int old_ref = -999;
-	// Hücre Voltajları için eski değerler
-	static float old_cells[14] = { 0.0 };
 	static uint16_t old_driver_error_code = 999;
 	static uint8_t old_battery_soc = 99;
+	static uint8_t old_farButton = 255;
 
 	static int old_temp0 = -999;
 	static int old_temp1 = -999;
 	static int old_temp2 = -999;
 	static int old_temp3 = -999;
-	int temp0 = ntc_temperatures[0];
-	int temp1 = ntc_temperatures[1];
-	int temp2 = ntc_temperatures[2];
-	int temp3 = ntc_temperatures[3];
 
-	driver_temp = Driver_Temperature();
-	motor_temp = Motor_Temperature();
+	static float old_cells[14] = { 0.0 };
+	static float old_min_cell = -1.0f, old_max_cell = -1.0f;
 
-	// 1. SAYFA
-	Dwin_Send_Int(0x5000, max_temp);
-	Send_Toggle_To_Display(0x5001, solSinyalButton);
-	Dwin_Send_Int(0x5002, dortluButton);
-	Send_Toggle_To_Display(0x5003, sagSinyalButton);
-	Send_Toggle_To_Display(0x5004, flasor);
-	Dwin_Send_Float(0x5100, battery_current);
-	Dwin_Send_Int(0x5200, max_temp);
-	Dwin_Send_Float(0x5300, h2_current);
-	Dwin_Send_Int(0x5400, motor_temp);
-	Dwin_Send_Int(0x5500, battery_voltage);
-	Dwin_Send_Int(0x5600, driver_temp);
-	Dwin_Send_Int(0x5700, speed);
-	Dwin_Send_Int(0x5800, ref);
-	Dwin_Send_Int(0x5900, battery_soc);
-	Dwin_Send_Int(0x5950, driver_error_code);
+	old_min_cell = min_cell_v;
+	old_max_cell = max_cell_v;
 
-	// 2. SAYFA
-	Dwin_Send_Int(0x7900, battery_soc);
-	Dwin_Send_Int(0x7950, driver_error_code);
-
-	if (battery_soc != old_battery_soc) {
-		Dwin_Send_Int(0x5100, battery_soc);
-		Dwin_Send_Int(0x7171, battery_soc);
-		old_battery_soc = battery_soc;
+	if (farButton != old_farButton) {
+		Dwin_Send_Int(0x5000, farButton);
+		old_farButton = farButton;
 	}
-
-	if (battery_voltage != old_battery_voltage) {
-		Dwin_Send_Int(0x5200, battery_voltage);
-		Dwin_Send_Int(0x7200, battery_voltage);
-		Dwin_Send_Int(0x8200, battery_voltage);
-		old_battery_voltage = battery_voltage;
-	}
-
 	if (battery_current != old_battery_current) {
-		Dwin_Send_Int(0x5300, battery_current);
+		Dwin_Send_Int(0x5100, battery_current);
 		old_battery_current = battery_current;
 	}
-
-	if (speed != old_speed) {
-		Dwin_Send_Int(0x5400, speed);
-		old_speed = speed;
-	}
-
 	if (max_temp != old_max_temp) {
-		Dwin_Send_Int(0x5500, max_temp);
+		Dwin_Send_Int(0x5200, max_temp);
 		old_max_temp = max_temp;
 	}
-
+	if (h2_current != old_h2_current) {
+		Dwin_Send_Float(0x5300, h2_current);
+		old_h2_current = h2_current;
+	}
+	if (motor_temp != old_motor_temp) {
+		Dwin_Send_Int(0x5400, motor_temp);
+        old_motor_temp = motor_temp;
+    }
+	if (battery_voltage != old_battery_voltage) {
+		Dwin_Send_Int(0x5500, battery_voltage);
+		old_battery_voltage = battery_voltage;
+	}
+	if (driver_temp != old_driver_temp) {
+		Dwin_Send_Int(0x5600, driver_temp);
+        old_driver_temp = driver_temp;
+    }
+	if (speed != old_speed) {
+		Dwin_Send_Int(0x5700, speed);
+		old_speed = speed;
+	}
 	if (ref != old_ref) {
 		Dwin_Send_Int(0x5800, ref);
 		old_ref = ref;
 	}
-
+	if (battery_soc != old_battery_soc) {
+		Dwin_Send_Int(0x5900, battery_soc);
+		Dwin_Send_Int(0x7900, battery_soc);
+		old_battery_soc = battery_soc;
+	}
 	if (driver_error_code != old_driver_error_code) {
 		Dwin_Send_Int(0x5950, driver_error_code);
 		Dwin_Send_Int(0x7950, driver_error_code);
@@ -539,29 +648,16 @@ void Send_To_Display() {
 	}
 
 	// v1..v9 arası 7010..7090, v10..v14 arası 7100..7140
-	uint16_t cell_addresses[14] = { 0x7010, 0x7020, 0x7030, 0x7040, 0x7050,
-			0x7060, 0x7070, 0x7080, 0x7090, 0x7100, 0x7110, 0x7120, 0x7130,
-			0x7140 };
+	uint16_t cell_addresses[14] = {
+		0x7010, 0x7020, 0x7030, 0x7040, 0x7050,
+		0x7060, 0x7070, 0x7080, 0x7090, 0x7100,
+		0x7110, 0x7120, 0x7130, 0x7140
+	};
 
 	for (int i = 0; i < 14; i++) {
 		Dwin_Send_Float(cell_addresses[i], cell_voltages[i + 3]);
 		old_cells[i] = cell_voltages[i + 3];
 	}
-
-	// Min/Max Cell
-	static float old_min_cell = -1, old_max_cell = -1;
-	Dwin_Send_Float(0x7300, min_cell_v);
-	old_min_cell = min_cell_v;
-
-	Dwin_Send_Float(0x7310, battery_voltage);
-
-	Dwin_Send_Float(0x7320, max_cell_v);
-	old_max_cell = max_cell_v;
-
-	Dwin_Send_Int(0x7771, temp0);
-	Dwin_Send_Int(0x7772, temp1);
-	Dwin_Send_Int(0x7773, temp2);
-	Dwin_Send_Int(0x7774, temp3);
 
 	if (temp0 != old_temp0) {
 		Dwin_Send_Int(0x7771, temp0);
@@ -569,61 +665,54 @@ void Send_To_Display() {
 	}
 
 	if (temp1 != old_temp1) {
-		Dwin_Send_Int(0x8202, temp1);
+		Dwin_Send_Int(0x7772, temp1);
 		old_temp1 = temp1;
 	}
 
-	if (driver_temp != old_driver_temp) {
-		Dwin_Send_Int(0x8203, driver_temp);
-        old_driver_temp = driver_temp;
-    }
+	if (temp2 != old_temp2) {
+		Dwin_Send_Int(0x7773, temp2);
+		old_temp2 = temp2;
+	}
 
-	if (motor_temp != old_motor_temp) {
-		Dwin_Send_Int(0x8204, motor_temp);
-        old_motor_temp = motor_temp;
-    }
+	if (temp3 != old_temp3) {
+		Dwin_Send_Int(0x7774, temp3);
+		old_temp3 = temp3;
+	}
 }
 
-void Send_Toggle_To_Display(uint16_t adress, uint16_t data) {
-	static uint8_t sequence_step = 0;
-	uint32_t state_start_time = 0;
+void Send_Signals_To_Display() {
 	uint32_t current_time = osKernelGetTickCount();
-	Dwin_Send_Int(adress, data);
+	uint8_t blink_flag = (current_time % 800) < 400 ? 1 : 0;
 
-	if (solSinyalButton == 1) {
-		switch (sequence_step) {
-		case 0: // Başlangıç durumu
-			Dwin_Send_Int(adress, 1);
-			state_start_time = current_time; // Zamanlayıcıyı başlat
-			sequence_step = 1;               // Bir sonraki adıma geç
-			break;
-		case 1: // Kapatmak için 2000 ms bekle
-			if ((current_time - state_start_time) >= 1000) {
-				Dwin_Send_Int(adress, 0);
-				state_start_time = current_time;
-				sequence_step = 2;
-			}
-			break;
-		case 2: // Açmak için 1000 ms bekle
-			if ((current_time - state_start_time) >= 1000) {
-				Dwin_Send_Int(adress, 1);
-				state_start_time = current_time;
-				sequence_step = 3;
-			}
-			break;
-		case 3: // Kapatmak için 2000 ms bekle
-			if ((current_time - state_start_time) >= 1000) {
-				Dwin_Send_Int(adress, 0);
-				state_start_time = current_time;
-				sequence_step = 4;
-			}
-			break;
-		case 4: // Diziyi başa sarmak için 1000 ms bekle
-			if ((current_time - state_start_time) >= 1000) {
-				sequence_step = 0;
-			}
-			break;
-		}
+	uint8_t target_sol = 0, target_sag = 0, target_dortlu = 0;
+
+	if (dortluButton == 1) {
+		target_sol = blink_flag;
+		target_sag = blink_flag;
+		target_dortlu = blink_flag;
+	} else {
+		if (solSinyalButton) target_sol = blink_flag;
+		if (sagSinyalButton == 1) target_sag = blink_flag;
+	}
+
+	static uint8_t old_sol = 255, old_sag = 255, old_dortlu = 255;
+	static uint8_t old_flasor = 255;
+
+	if (target_sol != old_sol) {
+		Dwin_Send_Int(0x5001, target_sol);
+		old_sol = target_sol;
+	}
+	if (target_sag != old_sag) {
+		Dwin_Send_Int(0x5003, target_sag);
+		old_sag = target_sag;
+	}
+	if (target_dortlu != old_dortlu) {
+		Dwin_Send_Int(0x5002, target_dortlu);
+		old_dortlu = target_dortlu;
+	}
+	if (flasor != old_flasor) {
+		Dwin_Send_Int(0x5004, flasor);
+		old_flasor = flasor;
 	}
 }
 
@@ -652,7 +741,7 @@ void TelemetryData() {
 	// Telemetri paketine verileri kopyalarken Mutex'i al
 	if (osMutexAcquire(dataMutexHandle, 10) == osOK) {
 		packet.speed = speed;
-		packet.tubeTemp = 15;
+		packet.tubeTemp = h2_temp;
 		packet.batteryTemp = max_temp;
 		packet.voltage = battery_voltage;
 		packet.charge = battery_soc;
@@ -713,37 +802,49 @@ uint8_t Calculate_Checksum(uint8_t *data, uint16_t len) {
     return crc;
 }
 
-void Receive_Surucu() {
-    uint8_t pkt_len = sizeof(MotorDriverData_t);
+void Receive_Surucu(void) {
+    uint8_t pkt_len = sizeof(DriverToVcu_Data_t);
 
-    // Buffer içerisinde paketi ara
-    for (int i = 0; i <= (DRIVER_RX_BUFFER_SIZE - pkt_len); i++) {
+    // 1. Henüz tam bir paket boyutu kadar veri gelmediyse çık
+    if (driver_rx_index < pkt_len) {
+        return;
+    }
 
-        // 1. Paket Başlığı (SOF: 0xA55A) Kontrolü
-        uint16_t possible_sof = driver_rx_buffer[i] | (driver_rx_buffer[i + 1] << 8);
+    // 2. Buffer içerisinde paketi ara
+    for (int i = 0; i <= (driver_rx_index - pkt_len); i++) {
+
+        // Paket Başlığı (SOF: 0xA55A) Kontrolü (Little-Endian)
+        uint16_t possible_sof = (uint16_t)driver_rx_buffer[i] | ((uint16_t)driver_rx_buffer[i + 1] << 8);
 
         if (possible_sof == MOTOR_DRIVER_SOF) {
 
-            // 2. Checksum Doğrulaması
+            // Checksum Doğrulaması
             uint8_t calc_crc = Calculate_Checksum(&driver_rx_buffer[i], pkt_len - 1);
             uint8_t rx_crc = driver_rx_buffer[i + pkt_len - 1];
 
             if (calc_crc == rx_crc) {
-                // 3. Veri Doğru! Doğrudan Struct'a kopyala
+                // Veri Doğru -> Struct'a kopyala
                 memcpy(&driver_rx_pkt, &driver_rx_buffer[i], pkt_len);
 
-                // Global değişkenlerinize doğrudan aktarın
+                // Global değişkenlere aktar
                 RPM = driver_rx_pkt.rpm;
                 ref = driver_rx_pkt.reference;
-                driver_error_code = driver_rx_pkt.faults;
+                driver_error_code = driver_rx_pkt.faults; // MCSDK ham hata kodu (1024, 128, 64...)
 
                 // Hız hesaplama
                 speed = (uint16_t)(RPM * 3.14159f * 0.55f * 60.0f / 1000.0f);
 
-                // Okunan paketi atlatalım
-                i += (pkt_len - 1);
+                // Paketi işledikten sonra buffer ve indeksi sıfırla
+                driver_rx_index = 0;
+                memset(driver_rx_buffer, 0, DRIVER_RX_BUFFER_SIZE);
+                break;
             }
         }
+    }
+
+    // Buffer dolduysa ve geçerli paket bulunamadıysa taşmayı önlemek için sıfırla
+    if (driver_rx_index >= DRIVER_RX_BUFFER_SIZE - 1) {
+        driver_rx_index = 0;
     }
 }
 
@@ -771,10 +872,10 @@ void Receive_BMS() {
 		battery_soc = (uint8_t) (s_raw * 0.1f);
 
 		// Veri geldiğini anlamak için LED'i yak söndür
-		HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+		HAL_GPIO_TogglePin(LED7_GPIO_Port, LED7_Pin);
 	}
 
-	else if (RxHeader.ExtId == 0x18954001) { // Hücre gerilimleri paketi [cite: 23, 26]
+	else if (RxHeader.ExtId == 0x18954001) { // Hücre gerilimleri paketi
 		// Byte 0: Frame numarasını verir (0'dan başlar)
 		uint8_t frame_no = RxData[0];
 
@@ -814,7 +915,7 @@ void Receive_BMS() {
 			}
 			//battery_soc = (uint8_t) (100 * toplam_hucre_voltaji / 58.8f);
 		}
-		HAL_GPIO_TogglePin(LED4_GPIO_Port, LED4_Pin);
+		HAL_GPIO_TogglePin(LED7_GPIO_Port, LED7_Pin);
 	}
 
 	else if (RxHeader.ExtId == 0x18964001) {
@@ -827,6 +928,8 @@ void Receive_BMS() {
 		if (frame_no == 1) {
 			ntc_temperatures[0] = (float) RxData[1] - 40.0f;
 			ntc_temperatures[1] = (float) RxData[2] - 40.0f;
+			ntc_temperatures[2] = (float) RxData[3] - 40.0f;
+			ntc_temperatures[3] = (float) RxData[4] - 40.0f;
 
 			min_temp =
 					(ntc_temperatures[0] < ntc_temperatures[1]) ?
@@ -836,22 +939,28 @@ void Receive_BMS() {
 					(ntc_temperatures[0] > ntc_temperatures[1]) ?
 							(uint8_t) ntc_temperatures[0] :
 							(uint8_t) ntc_temperatures[1];
+			temp0 = ntc_temperatures[0];
+			temp1 = ntc_temperatures[1];
+			temp2 = ntc_temperatures[2];
+			temp3 = ntc_temperatures[3];
 		}
-		HAL_GPIO_TogglePin(LED5_GPIO_Port, LED5_Pin);
+		HAL_GPIO_TogglePin(LED7_GPIO_Port, LED7_Pin);
 	}
 }
 
-void Transmit_Motor_Driver(void) {
+void Transmit_Motor_Driver(void) {  // BUTONLA KONTROL İPTAL EDİLDİ
     // Struct doldurma
     driver_tx_pkt.sof = MOTOR_DRIVER_SOF;
 	driver_tx_pkt.driver_reset = (uint16_t) resetButton;
 	driver_tx_pkt.engine_off = (uint16_t) surucuKapatButton;
 
     // Checksum hesapla (SOF'tan faults'a kadar olan alanlar)
-    driver_tx_pkt.crc = Calculate_Checksum((uint8_t*)&driver_tx_pkt, sizeof(VCUData_t) - 1);
+    driver_tx_pkt.crc = Calculate_Checksum((uint8_t*)&driver_tx_pkt, sizeof(VcuToDriver_Data_t) - 1);
 
     // Paketi tek seferde binary olarak gönder
-    HAL_UART_Transmit_IT(&huart6, (uint8_t*)&driver_tx_pkt, sizeof(VCUData_t));
+    if(HAL_UART_Transmit_IT(&huart6, (uint8_t*)&driver_tx_pkt, sizeof(VcuToDriver_Data_t)) == HAL_OK){
+    	osSemaphoreAcquire(uart6TxSemaphoreHandle, pdMS_TO_TICKS(10));
+    }
 }
 
 void System_On() {
@@ -1021,12 +1130,11 @@ void Horn_Flasher_Control() {
 }
 
 void Charge_Mode_Control() {
-	if (charger_status == 1 && max_temp < 55 && battery_voltage < 58.8) {
+	if (YSB_Status == 1 && max_temp < 55 && battery_voltage < 58.8) {
 		charging = 1;
 		HAL_GPIO_WritePin(YSB_GPIO_Port, YSB_Pin, 0);
 		YSB_Send_Command(charging); // YŞB'ye şarjı "BAŞLAT" komutu gönder
-	} else if (charger_status == 0 || max_temp > 55 || battery_voltage >= 58.8
-			|| battery_current <= 1.5) {
+	} else if (YSB_Status == 0 || max_temp > 55 || battery_voltage >= 58.8 || battery_current <= 1.5) {
 		charging = 0;
 		HAL_GPIO_WritePin(YSB_GPIO_Port, YSB_Pin, 1);
 		YSB_Send_Command(charging); // YŞB'ye şarjı "BİTİR" komutu gönder
@@ -1044,7 +1152,7 @@ void Direksiyon_Receive_Start() {
 }
 
 void Receive_Buttons() {
-	uint8_t pkt_len = sizeof(ButtonsData_t);
+	uint8_t pkt_len = sizeof(Buttons_Data_t);
 
 	if (buttons_rx_index < pkt_len) {
 		return;
@@ -1071,13 +1179,156 @@ void Receive_Buttons() {
 				h2AzaltButton = buttons_rx_pkt.h2Azalt;
 
 				buttons_rx_index = 0;
+				memset(buttons_rx_buffer, 0, BUTTONS_RX_BUFFER_SIZE);
 				break;
 			}
 		}
 	}
+	if (buttons_rx_index >= (BUTTONS_RX_BUFFER_SIZE - 1)) {
+		buttons_rx_index = 0;
+	}
 }
 
+//YŞB'YE GÖNDERİLEN ŞARJ KONTROL KOMUTU
+void Charger_Send_Command(float voltage, float current, uint8_t charge)
+{
+    uint16_t voltageValue;
+    uint16_t currentValue;
 
+    voltageValue = (uint16_t)(voltage * 10.0f);
+    currentValue = (uint16_t)(current * 10.0f);
+
+    if (HAL_GetTick() - ysb_timer > 1000) {
+		TxHeader.ExtId = 0x1806E5F4; //gönderilen can mesajının id'si
+		TxHeader.IDE = CAN_ID_EXT;
+		TxHeader.RTR = CAN_RTR_DATA;
+		TxHeader.DLC = 8;
+		TxHeader.TransmitGlobalTime = DISABLE;
+
+		memset(TxData, 0, 8); // Diğer byte'lar rezerve, 0 gönderiyoruz
+
+		TxData[0] = (voltageValue >> 8) & 0xFF;
+		TxData[1] = voltageValue & 0xFF;
+
+		TxData[2] = (currentValue >> 8) & 0xFF;
+		TxData[3] = currentValue & 0xFF;
+
+		TxData[4] = charge;
+
+		TxData[5] = 0;   // 0 = Charging mode
+
+		TxData[6] = 0;
+		TxData[7] = 0;
+
+		HAL_CAN_AddTxMessage(&hcan1, &TxHeader, TxData, &TxMailbox);
+		ysb_timer = HAL_GetTick();
+	}
+}
+
+//YŞB'DEN GELEN VERİNİN OKUNMASI
+void Receive_YSB(){
+	uint16_t outputVoltage;
+	uint16_t outputCurrent;
+
+	outputVoltage = ((uint16_t) RxData[0] << 8) | RxData[1];
+
+	outputCurrent = ((uint16_t) RxData[2] << 8) | RxData[3];
+
+	YSB_Voltage = outputVoltage / 10.0f;
+	YSB_Current = outputCurrent / 10.0f;
+
+	YSB_Status = RxData[4];
+
+	YSB_HardwareFault = (YSB_Status >> 0) & 0x01;
+
+	YSB_TemperatureFault = (YSB_Status >> 1) & 0x01;
+
+	YSB_InputVoltageFault = (YSB_Status >> 2) & 0x01;
+
+	YSB_BatteryFault = (YSB_Status >> 3) & 0x01;
+
+	YSB_CommunicationFault = (YSB_Status >> 4) & 0x01;
+
+	HAL_GPIO_TogglePin(LED8_GPIO_Port, LED8_Pin);
+}
+
+void Receive_H2_CAN() {
+    // Little-Endian
+    int16_t raw_temp = (int16_t)(RxData[0] | (RxData[1] << 8));
+    int16_t raw_current = (int16_t)(RxData[2] | (RxData[3] << 8));
+
+    h2_temp = (float)raw_temp / 100.0f;
+    h2_current = (float)raw_current / 100.0f;
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+}
+
+void Transmit_H2_CAN()
+{
+    if (HAL_GetTick() - h2_timer > 500) {
+		h2TxHeader.StdId = 0x407; // F103 için belirlenen Buton Komut ID'si
+		h2TxHeader.IDE = CAN_ID_STD;
+		h2TxHeader.RTR = CAN_RTR_DATA;
+		h2TxHeader.DLC = 8;
+		h2TxHeader.TransmitGlobalTime = DISABLE;
+
+		h2TxData[0] = h2ArttirButton; // Byte 0: Artır (1 veya 0)
+		h2TxData[1] = h2AzaltButton;  // Byte 1: Azalt (1 veya 0)
+
+		if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0) {
+			HAL_CAN_AddTxMessage(&hcan1, &h2TxHeader, h2TxData, &h2TxMailbox);
+			HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+		}
+
+		h2_timer = HAL_GetTick();
+	}
+}
+
+void H2_Receive_Start(void) {
+    HAL_UART_Receive_IT(&huart4, &h2_rx_byte, 1);
+}
+
+void Receive_H2_UART(void) {
+    uint8_t pkt_len = sizeof(H2ToVcu_Data_t);
+
+    if (h2_rx_index < pkt_len) {
+        return;
+    }
+
+    for (int i = 0; i <= (h2_rx_index - pkt_len); i++) {
+        uint16_t possible_sof = h2_rx_buffer[i] | (h2_rx_buffer[i + 1] << 8);
+
+        if (possible_sof == H2_SOF) {
+            uint8_t calc_crc = Calculate_Checksum(&h2_rx_buffer[i], pkt_len - 1);
+            uint8_t rx_crc = h2_rx_buffer[i + pkt_len - 1];
+
+            if (calc_crc == rx_crc) {
+                memcpy(&h2_rx_pkt, &h2_rx_buffer[i], pkt_len);
+
+                // Verileri float formatına çevirip global değişkenlere aktar
+                h2_temp = (float)h2_rx_pkt.temperature / 100.0f;
+                h2_current = (float)h2_rx_pkt.current / 100.0f;
+
+                h2_rx_index = 0; // Buffer'ı temizle
+                break;
+            }
+        }
+    }
+}
+
+void Transmit_H2_UART(void) {
+    // Struct doldurma
+    h2_tx_pkt.sof = H2_SOF;
+	h2_tx_pkt.h2Azalt = (uint16_t) h2AzaltButton;
+	h2_tx_pkt.h2Arttir = (uint16_t) h2ArttirButton;
+
+    // Checksum hesapla (SOF'tan faults'a kadar olan alanlar)
+	h2_tx_pkt.crc = Calculate_Checksum((uint8_t*)&h2_tx_pkt, sizeof(VcuToH2_Data_t) - 1);
+
+    // Paketi tek seferde binary olarak gönder
+    if(HAL_UART_Transmit_IT(&huart4, (uint8_t*)&h2_tx_pkt, sizeof(VcuToH2_Data_t)) == HAL_OK){
+    	osSemaphoreAcquire(uart4TxSemaphoreHandle, pdMS_TO_TICKS(10));
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -1119,12 +1370,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART6_UART_Init();
   MX_UART5_Init();
+  MX_UART4_Init();
   /* USER CODE BEGIN 2 */
 	System_On();
 	//Display_Startup_Animation();
 	HAL_CAN_Start(&hcan1);
 	HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
 	Driver_Receive_Start();
+	H2_Receive_Start();
 	Direksiyon_Receive_Start();
 	LoraMode();
 	TelemetryStart();
@@ -1166,6 +1419,15 @@ int main(void)
   /* creation of uart6TxSemaphore */
   uart6TxSemaphoreHandle = osSemaphoreNew(1, 1, &uart6TxSemaphore_attributes);
 
+  /* creation of uart1RxSemaphore */
+  uart1RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart1RxSemaphore_attributes);
+
+  /* creation of uart4RxSemaphore */
+  uart4RxSemaphoreHandle = osSemaphoreNew(1, 1, &uart4RxSemaphore_attributes);
+
+  /* creation of uart4TxSemaphore */
+  uart4TxSemaphoreHandle = osSemaphoreNew(1, 1, &uart4TxSemaphore_attributes);
+
   /* USER CODE BEGIN RTOS_SEMAPHORES */
 	// görevler (tasks) başlamadan önce içlerini "boşaltıyoruz".
 	osSemaphoreAcquire(adc1SemaphoreHandle, 0);
@@ -1177,7 +1439,8 @@ int main(void)
 	osSemaphoreAcquire(uart6RxSemaphoreHandle, 0);
 	osSemaphoreAcquire(uart5RxSemaphoreHandle, 0);
 	osSemaphoreAcquire(uart6TxSemaphoreHandle, 0);
-
+	osSemaphoreAcquire(uart4RxSemaphoreHandle, 0);
+	osSemaphoreAcquire(uart4TxSemaphoreHandle, 0);
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -1195,8 +1458,8 @@ int main(void)
   /* creation of SafetyTask */
   SafetyTaskHandle = osThreadNew(vSafetyTask, NULL, &SafetyTask_attributes);
 
-  /* creation of CanTask */
-  CanTaskHandle = osThreadNew(vCanTask, NULL, &CanTask_attributes);
+  /* creation of CommunicationTa */
+  CommunicationTaHandle = osThreadNew(vCommunicationTask, NULL, &CommunicationTa_attributes);
 
   /* creation of DisplayTask */
   DisplayTaskHandle = osThreadNew(vDisplayTask, NULL, &DisplayTask_attributes);
@@ -1412,7 +1675,7 @@ static void MX_CAN1_Init(void)
 
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 12;
+  hcan1.Init.Prescaler = 6;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
   hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
@@ -1488,6 +1751,39 @@ static void MX_DAC_Init(void)
   /* USER CODE BEGIN DAC_Init 2 */
 
   /* USER CODE END DAC_Init 2 */
+
+}
+
+/**
+  * @brief UART4 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART4_Init(void)
+{
+
+  /* USER CODE BEGIN UART4_Init 0 */
+
+  /* USER CODE END UART4_Init 0 */
+
+  /* USER CODE BEGIN UART4_Init 1 */
+
+  /* USER CODE END UART4_Init 1 */
+  huart4.Instance = UART4;
+  huart4.Init.BaudRate = 9600;
+  huart4.Init.WordLength = UART_WORDLENGTH_8B;
+  huart4.Init.StopBits = UART_STOPBITS_1;
+  huart4.Init.Parity = UART_PARITY_NONE;
+  huart4.Init.Mode = UART_MODE_TX_RX;
+  huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART4_Init 2 */
+
+  /* USER CODE END UART4_Init 2 */
 
 }
 
@@ -1758,10 +2054,17 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
 		// "if" yerine "while" kullanıyoruz. İçerideki tüm paketleri toplar.
 		while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
 			if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
-				/*if (RxHeader.IDE == CAN_ID_STD) {
+				if (RxHeader.IDE == CAN_ID_STD) {
 //                    Receive_Direksiyon();
-				} else */if (RxHeader.IDE == CAN_ID_EXT) {
-					Receive_BMS();
+					if (RxHeader.StdId == 0x103) {
+						Receive_H2_CAN();
+					}
+				} else if (RxHeader.IDE == CAN_ID_EXT) {
+					if (RxHeader.ExtId == 0x18FF50E5) {
+						Receive_YSB();
+					} else {
+						Receive_BMS(); // Daly BMS ID'leri (0x18904001, 0x18954001, 0x18964001)
+					}
 				}
 			}
 		}
@@ -1810,24 +2113,38 @@ void vSafetyTask(void *argument)
   /* USER CODE END vSafetyTask */
 }
 
-/* USER CODE BEGIN Header_vCanTask */
+/* USER CODE BEGIN Header_vCommunicationTask */
 /**
- * @brief Function implementing the CanTask thread.
- * @param argument: Not used
- * @retval None
- */
-/* USER CODE END Header_vCanTask */
-void vCanTask(void *argument)
+* @brief Function implementing the CommunicationTa thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_vCommunicationTask */
+void vCommunicationTask(void *argument)
 {
-  /* USER CODE BEGIN vCanTask */
+  /* USER CODE BEGIN vCommunicationTask */
 	/* Infinite loop */
 	for (;;) {
 		Send_Request_BMS(); // Periyodik BMS sorguları (Zamanlama takipleri içindedir)
-		Receive_Surucu();
-		Receive_Buttons();
+		Charger_Send_Command(user_voltage, user_current, user_charge);
+
+		if (osSemaphoreAcquire(uart6RxSemaphoreHandle, 0) == osOK) {
+			Receive_Surucu();
+		}
+
+		if (osSemaphoreAcquire(uart5RxSemaphoreHandle, 0) == osOK) {
+			Receive_Buttons();
+		}
+		/*if (osSemaphoreAcquire(uart4RxSemaphoreHandle, 0) == osOK) {
+		  Receive_H2_UART();
+		}*/
+
+		Transmit_H2_CAN();
+
+		//Transmit_Motor_Driver();
 		osDelay(20);		// Görevi 20 ms uyut
 	}
-  /* USER CODE END vCanTask */
+  /* USER CODE END vCommunicationTask */
 }
 
 /* USER CODE BEGIN Header_vDisplayTask */
@@ -1840,9 +2157,11 @@ void vCanTask(void *argument)
 void vDisplayTask(void *argument)
 {
   /* USER CODE BEGIN vDisplayTask */
+	Start_Display();
 	//Display_Startup_Animation();
 	/* Infinite loop */
 	for (;;) {
+		Send_Signals_To_Display();
 		Send_To_Display();
 		osDelay(50);		// Görevi 50 ms uyut
 	}
