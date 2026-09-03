@@ -12,9 +12,9 @@
  ******************************************************************************
  * @file           : main.c
  * @project        : VoltaFCEV Vehicle Control Unit Firmware
- * @version        : 2.4.0 (FreeRTOS integrated)
+ * @version        : 2.5.0 (FreeRTOS integrated)
  * @author         : VCU TEAM
- * @date           : 28-08-2026
+ * @date           : 03-09-2026
  ******************************************************************************
  * @note
  * This firmware handles CAN communication with BMS, motor controller
